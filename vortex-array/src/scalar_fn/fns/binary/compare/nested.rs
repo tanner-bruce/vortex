@@ -15,12 +15,14 @@
 use std::cmp::Ordering;
 
 use num_traits::AsPrimitive;
+use num_traits::ToPrimitive;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
 
+use crate::AnyCanonical;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
@@ -29,10 +31,13 @@ use crate::arrays::BoolArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::ExtensionArray;
 use crate::arrays::FixedSizeListArray;
+use crate::arrays::List;
 use crate::arrays::ListViewArray;
 use crate::arrays::MapArray;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
+use crate::arrays::VarBin;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::decimal::widened_buffer;
 use crate::arrays::extension::ExtensionArrayExt;
@@ -40,6 +45,9 @@ use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::map::MapArraySlotsExt;
 use crate::arrays::struct_::StructArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
+use crate::arrays::varbinview::build_views::MAX_BUFFER_LEN;
+use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
@@ -50,6 +58,114 @@ use crate::scalar_fn::fns::operators::CompareOperator;
 
 /// A row comparator: compares row `i` of the left operand against row `j` of the right operand.
 pub(crate) type RowComparator = Box<dyn Fn(usize, usize) -> Ordering>;
+
+/// Reuse this module's equality comparator for one nested-list constancy evaluation.
+/// Other element types retain their existing encoded comparison dispatch.
+pub(crate) fn nested_list_elements_are_constant(
+    list: &ListViewArray,
+    first_size: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<bool>> {
+    let dtype = list.elements().dtype();
+    if !matches!(
+        dtype,
+        DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) | DType::Map(..)
+    ) || !constancy_comparator_supported(dtype)
+        || !constancy_backing_is_eager(list.elements())
+        || !constancy_backing_is_eager(list.offsets())
+    {
+        return Ok(None);
+    }
+
+    // The caller has checked equal, nonzero sizes, unequal offsets and the first pair.
+    // The canonical backing and comparator live only for this statistic evaluation. Prepare them once,
+    // rather than recursively executing and comparing two fresh slices for every list.
+    let elements = list
+        .elements()
+        .clone()
+        .execute::<RecursiveCanonical>(ctx)?
+        .0
+        .into_array();
+    let comparator = build_comparator(&elements, &elements, ctx)?;
+    let offsets = usize_values(list.offsets(), ctx)?;
+    let first = offsets[0];
+    for &offset in &offsets[2..] {
+        for element in 0..first_size {
+            if !comparator(first + element, offset + element).is_eq() {
+                return Ok(Some(false));
+            }
+        }
+    }
+    Ok(Some(true))
+}
+
+// Whole-child preparation must not evaluate lazy expressions in unused ranges, nor
+// introduce device execution that the original validity/early-exit path could avoid.
+// Canonical arrays, Arrow-style lists and offset-based byte arrays have materialized
+// backing. Inspect every stored child slot, including validity, without executing
+// unknown encodings or allocating payloads. List constructors validate their offsets;
+// VarBin's public binary constructor does not, so prove its conversion bounds here.
+fn constancy_backing_is_eager(array: &ArrayRef) -> bool {
+    if !(array.is::<AnyCanonical>() || array.is::<List>() || array.is::<VarBin>())
+        || !array.buffer_handles().iter().all(BufferHandle::is_on_host)
+        || !array.children_iter().all(constancy_backing_is_eager)
+    {
+        return false;
+    }
+    let Some(varbin) = array.as_opt::<VarBin>() else {
+        return true;
+    };
+    let Some(offsets) = varbin.offsets().as_opt::<Primitive>() else {
+        return false;
+    };
+    if !offsets.dtype().is_int()
+        || offsets.dtype().is_nullable()
+        || offsets.len().checked_sub(1) != Some(array.len())
+    {
+        return false;
+    }
+    let bytes_len = varbin.bytes_handle().len();
+    match_each_integer_ptype!(offsets.ptype(), |P| {
+        let mut previous = 0usize;
+        for (index, &offset) in offsets.as_slice::<P>().iter().enumerate() {
+            let Some(offset) = offset.to_usize() else {
+                return false;
+            };
+            if offset > bytes_len
+                || (index != 0 && (offset < previous || offset - previous > MAX_BUFFER_LEN))
+            {
+                return false;
+            }
+            previous = offset;
+        }
+        true
+    })
+}
+
+// Eager setup must not introduce unsupported-child errors that the original per-pair
+// validity/early-mismatch checks could avoid. Keep those dtypes on the original path.
+fn constancy_comparator_supported(dtype: &DType) -> bool {
+    match dtype {
+        DType::Null
+        | DType::Bool(_)
+        | DType::Primitive(..)
+        | DType::Decimal(..)
+        | DType::Utf8(_)
+        | DType::Binary(_) => true,
+        DType::Struct(fields, _) => fields
+            .fields()
+            .all(|dtype| constancy_comparator_supported(&dtype)),
+        DType::List(element, _) | DType::FixedSizeList(element, ..) => {
+            constancy_comparator_supported(element)
+        }
+        DType::Map(map, _) => {
+            constancy_comparator_supported(&map.key_dtype())
+                && constancy_comparator_supported(&map.value_dtype())
+        }
+        DType::Extension(extension) => constancy_comparator_supported(extension.storage_dtype()),
+        DType::Union(..) | DType::Variant(_) => false,
+    }
+}
 
 /// Compare two nested arrays row by row.
 pub(super) fn compare_nested(

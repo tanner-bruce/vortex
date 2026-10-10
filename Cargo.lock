@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "compress-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4236,7 +4236,7 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 
 [[package]]
 name = "duckdb-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5049,7 +5049,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-scan-cli"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "clap",
  "futures",
@@ -6146,7 +6146,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-cast 58.4.1",
@@ -9022,7 +9022,7 @@ dependencies = [
 
 [[package]]
 name = "random-access-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -10286,7 +10286,7 @@ dependencies = [
 
 [[package]]
 name = "string-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -11314,7 +11314,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vortex"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -11363,7 +11363,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-alp"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "alp",
  "codspeed-divan-compat",
@@ -11383,7 +11383,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-array"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "allocator-api2",
  "arbitrary",
@@ -11443,7 +11443,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-array-macros"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11452,7 +11452,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-arrow"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-buffer 59.3.2",
@@ -11480,7 +11480,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-bench"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -11546,7 +11546,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-bench-support"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11555,7 +11555,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-btrblocks"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "enum-iterator",
@@ -11587,7 +11587,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-buffer"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "allocator-api2",
  "arrow-buffer 59.3.2",
@@ -11612,7 +11612,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-bytebool"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -11628,7 +11628,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cloud"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "http",
  "object_store 0.13.2",
@@ -11652,7 +11652,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-compat"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-select 59.3.2",
@@ -11679,7 +11679,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-compressor"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "itertools 0.14.0",
@@ -11700,7 +11700,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-compute"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -11712,7 +11712,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cub"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "bindgen",
  "libloading",
@@ -11723,7 +11723,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cuda"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-schema 59.3.2",
  "async-channel",
@@ -11760,7 +11760,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cuda-driver"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "half",
  "libloading",
@@ -11773,7 +11773,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cuda-ffi"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-schema 59.3.2",
  "cbindgen",
@@ -11788,7 +11788,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-cuda-macros"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "quote",
  "syn 3.0.9",
@@ -11796,7 +11796,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-datafusion"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -11836,7 +11836,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-datetime-parts"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -11854,7 +11854,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-decimal-byte-parts"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "hegeltest",
@@ -11874,7 +11874,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-duckdb"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -11914,7 +11914,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-edition"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "parking_lot",
  "vortex-error",
@@ -11923,7 +11923,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-elias-fano"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -11939,7 +11939,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-error"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-schema 59.3.2",
  "flatbuffers",
@@ -11953,7 +11953,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-expr"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "itertools 0.14.0",
  "parking_lot",
@@ -11968,7 +11968,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-fastlanes"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "fastlanes 0.7.2",
@@ -11993,7 +11993,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-ffi"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -12016,7 +12016,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-file"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "allocator-api2",
  "arrow-array 59.3.2",
@@ -12071,7 +12071,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-fsst"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "fsst-rs",
@@ -12090,7 +12090,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-fuzz"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arbitrary",
  "itertools 0.14.0",
@@ -12118,7 +12118,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-io"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -12151,7 +12151,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-ipc"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -12167,7 +12167,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-jni"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-buffer 59.3.2",
@@ -12195,7 +12195,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-json"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -12209,7 +12209,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-layout"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arcref",
@@ -12265,7 +12265,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-mask"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "hegeltest",
@@ -12281,7 +12281,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-metrics"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "parking_lot",
  "sketches-ddsketch",
@@ -12289,7 +12289,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-nvcomp"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "bindgen",
  "libloading",
@@ -12301,7 +12301,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-onpair"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -12318,7 +12318,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-parquet-variant"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-buffer 59.3.2",
@@ -12345,7 +12345,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-pco"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -12362,7 +12362,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-python"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-data 59.3.2",
@@ -12394,11 +12394,11 @@ dependencies = [
 
 [[package]]
 name = "vortex-python-abi"
-version = "0.1.0"
+version = "0.93.0"
 
 [[package]]
 name = "vortex-python-cuda"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-schema 59.3.2",
  "bytes",
@@ -12410,7 +12410,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-row"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-row 59.3.2",
@@ -12429,7 +12429,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-scan"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -12448,7 +12448,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-sequence"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "mimalloc",
@@ -12466,7 +12466,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-session"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arc-swap",
  "lasso",
@@ -12477,7 +12477,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-sparse"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "codspeed-divan-compat",
  "itertools 0.14.0",
@@ -12495,7 +12495,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-spatial"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -12523,7 +12523,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-sqllogictest"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12546,7 +12546,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-tensor"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -12570,7 +12570,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-test-e2e-cuda"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -12581,7 +12581,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-tui"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -12614,7 +12614,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-utils"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "dashmap",
  "hashbrown 0.17.1",
@@ -12622,7 +12622,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-uuid"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-buffer 59.3.2",
@@ -12657,7 +12657,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-zigzag"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "rstest",
  "vortex-array",
@@ -12671,7 +12671,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-zstd"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -13188,7 +13188,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.93.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -50,6 +50,7 @@ mod decimal;
 
 mod nested;
 pub(crate) use nested::build_comparator as build_row_comparator;
+pub(crate) use nested::nested_list_elements_are_constant;
 
 mod primitive;
 
