@@ -52,6 +52,7 @@ pub(crate) use boolean::execute_boolean;
 pub use boolean::kleene_boolean_buffer_scalar;
 pub use boolean::kleene_boolean_buffers;
 mod compare;
+pub(crate) use compare::nested_list_elements_are_constant;
 pub use compare::*;
 mod numeric;
 pub(crate) use numeric::*;
