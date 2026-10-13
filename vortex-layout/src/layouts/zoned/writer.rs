@@ -77,6 +77,7 @@ pub struct ZonedStrategy {
     child: Arc<dyn LayoutStrategy>,
     stats: Arc<dyn LayoutStrategy>,
     options: ZonedLayoutOptions,
+    task_lifetime: Option<Arc<dyn Send + Sync>>,
 }
 
 impl ZonedStrategy {
@@ -90,7 +91,19 @@ impl ZonedStrategy {
             child: Arc::new(child),
             stats: Arc::new(stats),
             options,
+            task_lifetime: None,
         }
+    }
+
+    /// Retain an owner while this strategy or any of its statistics tasks is alive.
+    ///
+    /// Each CPU task captures a clone before scheduling. Cancelling the consuming
+    /// future cannot release the owner while started statistics work is still
+    /// running; discarded queued tasks release their clone without doing the work.
+    /// The owner is not stored in the session or the resulting layout.
+    pub fn with_task_lifetime(mut self, owner: Arc<dyn Send + Sync>) -> Self {
+        self.task_lifetime = Some(owner);
+        self
     }
 }
 
@@ -128,11 +141,16 @@ impl LayoutStrategy for ZonedStrategy {
 
         let stream_dtype = stream.dtype().clone();
         let concurrency = self.options.concurrency.get();
+        let task_lifetime = self.task_lifetime.clone();
         let stream = stream
             .map(move |item| {
                 let aggregate_fns = Arc::clone(&aggregate_fns);
                 let session = compute_session.clone();
+                let task_lifetime = task_lifetime.clone();
                 session.handle().spawn_cpu(move || {
+                    // This guard must survive both normal return and unwinding,
+                    // independently of the strategy and the task's consumer.
+                    let _task_lifetime = task_lifetime;
                     let (sequence_id, chunk) = item?;
                     let partials = aggregate_partials(
                         &chunk,
@@ -231,6 +249,10 @@ fn default_zoned_aggregate_fns(dtype: &DType, session: &VortexSession) -> Arc<[A
 
     aggregate_fns.into()
 }
+
+#[cfg(test)]
+#[path = "writer/task_lifetime_tests.rs"]
+mod task_lifetime_tests;
 
 #[cfg(test)]
 mod tests {
