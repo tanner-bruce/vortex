@@ -6,8 +6,6 @@ use super::*;
 use crate::VortexSessionExecute;
 use crate::array_session;
 use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::listview::ListViewArrayExt;
-use crate::builtins::ArrayBuiltins;
 use crate::dtype::FieldNames;
 use crate::dtype::MapDType;
 use crate::dtype::PType;
