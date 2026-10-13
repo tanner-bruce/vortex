@@ -76,6 +76,12 @@ pub(crate) fn nested_list_elements_are_constant(
         return Ok(None);
     }
 
+    // Borrow only already-primitive host offsets. Executing an encoding here could
+    // evaluate offsets the original per-pair path would never consume.
+    let Some(offsets) = list.offsets().as_opt::<Primitive>() else {
+        return Ok(None);
+    };
+
     // The caller has checked equal, nonzero sizes, unequal offsets and the first pair.
     // The canonical backing and comparator live only for this statistic evaluation. Prepare them once,
     // rather than recursively executing and comparing two fresh slices for every list.
@@ -86,16 +92,19 @@ pub(crate) fn nested_list_elements_are_constant(
         .0
         .into_array();
     let comparator = build_comparator(&elements, &elements, ctx)?;
-    let offsets = usize_values(list.offsets(), ctx)?;
-    let first = offsets[0];
-    for &offset in &offsets[2..] {
-        for element in 0..first_size {
-            if !comparator(first + element, offset + element).is_eq() {
-                return Ok(Some(false));
+    match_each_integer_ptype!(offsets.ptype(), |P| {
+        let offsets = offsets.as_slice::<P>();
+        let first: usize = offsets[0].as_();
+        for &offset in &offsets[2..] {
+            let offset: usize = offset.as_();
+            for element in 0..first_size {
+                if !comparator(first + element, offset + element).is_eq() {
+                    return Ok(Some(false));
+                }
             }
         }
-    }
-    Ok(Some(true))
+        Ok(Some(true))
+    })
 }
 
 // Whole-child preparation must not evaluate lazy expressions in unused ranges, nor
@@ -298,6 +307,7 @@ fn build_values_comparator(
             })
         }
         DType::List(..) => {
+            let same_array = ArrayRef::ptr_eq(lhs, rhs);
             let lhs = lhs.clone().execute::<ListViewArray>(ctx)?;
             let rhs = rhs.clone().execute::<ListViewArray>(ctx)?;
             let elements = build_comparator(lhs.elements(), rhs.elements(), ctx)?;
@@ -305,6 +315,16 @@ fn build_values_comparator(
             // per-call encoding dispatch inside the row loop.
             let lhs_offsets = usize_values(lhs.offsets(), ctx)?;
             let lhs_sizes = usize_values(lhs.sizes(), ctx)?;
+            if same_array {
+                return Ok(Box::new(move |i, j| {
+                    let lhs_len = lhs_sizes[i];
+                    let rhs_len = lhs_sizes[j];
+                    (0..lhs_len.min(rhs_len))
+                        .map(|el| elements(lhs_offsets[i] + el, lhs_offsets[j] + el))
+                        .find(|ordering| ordering.is_ne())
+                        .unwrap_or_else(|| lhs_len.cmp(&rhs_len))
+                }));
+            }
             let rhs_offsets = usize_values(rhs.offsets(), ctx)?;
             let rhs_sizes = usize_values(rhs.sizes(), ctx)?;
             Box::new(move |i, j| {
@@ -379,3 +399,7 @@ fn view_bytes(array: &VarBinViewArray, index: usize) -> &[u8] {
         &array.buffer(view.buffer_index as usize).as_slice()[view.as_range()]
     }
 }
+
+#[cfg(test)]
+#[path = "nested_tests.rs"]
+mod tests;

@@ -3,6 +3,7 @@
 
 //! Differential oracle retained from vortex-array 0.86.1's original list loop.
 use half::f16;
+use num_traits::AsPrimitive;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -1018,4 +1019,53 @@ fn lazy_unused_values_after_equal_first_pair_remain_unobserved() -> VortexResult
         },
         Some(true),
     )
+}
+
+#[test]
+fn zy283_all_outer_offset_widths_and_mismatch_positions() -> VortexResult<()> {
+    macro_rules! width {
+        ($ty:ty) => {
+            for mismatch in [None, Some(1usize), Some(2), Some(3), Some(5)] {
+                for offsets in [
+                    [2usize, 4, 6, 8, 10, 12],
+                    [2, 2, 6, 4, 8, 10],
+                    [2, 3, 4, 5, 6, 7],
+                ] {
+                    compare(
+                        stringify!($ty),
+                        || {
+                            let mut values = [1i32; 16];
+                            if let Some(index) = mismatch {
+                                values[offsets[index]] = 2;
+                            }
+                            let offsets = PrimitiveArray::from_iter(offsets.map(|i| {
+                                let offset: $ty = i.as_();
+                                offset
+                            }))
+                            .into_array();
+                            ListViewArray::try_new(
+                                structure(
+                                    PrimitiveArray::from_iter(values).into_array(),
+                                    Validity::NonNullable,
+                                )?,
+                                offsets,
+                                PrimitiveArray::from_iter([1u64; 6]).into_array(),
+                                Validity::NonNullable,
+                            )
+                        },
+                        None,
+                    )?;
+                }
+            }
+        };
+    }
+    width!(u8);
+    width!(u16);
+    width!(u32);
+    width!(u64);
+    width!(i8);
+    width!(i16);
+    width!(i32);
+    width!(i64);
+    Ok(())
 }
