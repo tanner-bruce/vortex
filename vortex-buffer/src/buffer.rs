@@ -27,6 +27,36 @@ use crate::ByteBuffer;
 use crate::debug::TruncatedDebug;
 use crate::trusted_len::TrustedLen;
 
+/// A read-only description of the storage retained by a buffer view.
+///
+/// Addresses identify storage only while the buffer's owner remains alive. They do not grant
+/// ownership or permission to read bytes outside the initialized view. In particular, allocation
+/// capacity can include uninitialized spare space and alignment padding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedRootGeometry {
+    /// No payload allocation is retained, even if bounded ownership bookkeeping remains.
+    Empty,
+    /// Exact allocator-owned storage, independent of the current view's offset or length.
+    ExactOwned {
+        /// Address of the allocation, which may precede the initialized view.
+        allocation_start: usize,
+        /// Full allocation size in bytes, including spare capacity and alignment padding.
+        allocation_bytes: usize,
+    },
+    /// Root geometry declared by an Arrow buffer, not proof of its owner's full retained capacity.
+    /// A custom Arrow owner can itself retain a larger allocation.
+    ArrowDeclared {
+        /// Address reported by Arrow for the start of its declared storage.
+        data_start: usize,
+        /// Capacity reported by Arrow in bytes.
+        capacity: usize,
+    },
+    /// A Bytes owner whose full retained storage cannot be established from its exposed view.
+    OpaqueBytes,
+    /// An external owner whose full retained storage is not exposed.
+    OpaqueExternal,
+}
+
 /// An immutable buffer of items of `T`.
 ///
 /// Zero-sized element types are rejected at compile time when constructing a buffer.
@@ -111,6 +141,30 @@ impl<T: Hash> Hash for Buffer<T> {
 }
 
 impl<T> Buffer<T> {
+    /// Describe retained storage without cloning owners, allocating, or reading payload bytes.
+    ///
+    /// An empty view can retain a nonempty allocation. Only absent or zero-sized owned storage
+    /// reports [`RetainedRootGeometry::Empty`]; opaque owners remain opaque even for empty views.
+    pub fn retained_root_geometry(&self) -> RetainedRootGeometry {
+        match self.backing.as_deref() {
+            None => RetainedRootGeometry::Empty,
+            Some(BufferBacking::Owned(allocation)) if allocation.size() == 0 => {
+                RetainedRootGeometry::Empty
+            }
+            Some(BufferBacking::Owned(allocation)) => RetainedRootGeometry::ExactOwned {
+                allocation_start: allocation.ptr().as_ptr() as usize,
+                allocation_bytes: allocation.size(),
+            },
+            Some(BufferBacking::Bytes(_)) => RetainedRootGeometry::OpaqueBytes,
+            #[cfg(feature = "arrow")]
+            Some(BufferBacking::Arrow(arrow)) => RetainedRootGeometry::ArrowDeclared {
+                data_start: arrow.data_ptr().as_ptr() as usize,
+                capacity: arrow.capacity(),
+            },
+            Some(BufferBacking::External { .. }) => RetainedRootGeometry::OpaqueExternal,
+        }
+    }
+
     pub(crate) fn from_allocation(
         allocation: Allocation,
         offset: usize,
@@ -971,7 +1025,168 @@ mod test {
     use crate::Buffer;
     use crate::BufferBacking;
     use crate::ByteBuffer;
+    use crate::RetainedRootGeometry;
     use crate::buffer;
+
+    #[test]
+    fn retained_root_geometry_oversized_owned_and_empty_views() {
+        let mut values = Vec::with_capacity(1024);
+        values.extend_from_slice(&[7_u8; 32]);
+        let expected = RetainedRootGeometry::ExactOwned {
+            allocation_start: values.as_ptr() as usize,
+            allocation_bytes: values.capacity(),
+        };
+        let buffer = ByteBuffer::from(values);
+        assert_eq!(buffer.retained_root_geometry(), expected);
+        assert_eq!(
+            buffer.slice_unaligned(8..16).retained_root_geometry(),
+            expected
+        );
+        assert_eq!(
+            buffer.slice_unaligned(16..16).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        let mut cleared = buffer.clone();
+        cleared.clear();
+        assert_eq!(cleared.retained_root_geometry(), expected);
+        assert_eq!(
+            ByteBuffer::empty().retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        assert_eq!(
+            ByteBuffer::from(Vec::new()).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+    }
+
+    #[test]
+    fn retained_root_geometry_typed_capacity_uses_bytes() {
+        let mut values = Vec::with_capacity(128);
+        values.extend_from_slice(&[11_u64; 4]);
+        let expected = RetainedRootGeometry::ExactOwned {
+            allocation_start: values.as_ptr() as usize,
+            allocation_bytes: values.capacity() * size_of::<u64>(),
+        };
+        let buffer = Buffer::from(values);
+        assert_eq!(buffer.retained_root_geometry(), expected);
+        assert_eq!(buffer.slice(1..2).retained_root_geometry(), expected);
+        assert_eq!(buffer.into_byte_buffer().retained_root_geometry(), expected);
+    }
+
+    #[test]
+    fn retained_root_geometry_aligned_storage_includes_padding() {
+        let mut buffer = crate::BufferMut::<u32>::with_capacity_aligned(37, Alignment::new(4096));
+        buffer.push(13);
+        let expected = RetainedRootGeometry::ExactOwned {
+            allocation_start: buffer.allocation.ptr().as_ptr() as usize,
+            allocation_bytes: buffer.allocation.size(),
+        };
+        assert!(buffer.allocation.size() > 37 * size_of::<u32>());
+        let buffer = buffer.freeze();
+        assert_eq!(buffer.retained_root_geometry(), expected);
+        assert_eq!(
+            buffer.slice(0..0).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        let mut cleared = buffer.clone();
+        cleared.clear();
+        assert_eq!(cleared.retained_root_geometry(), expected);
+    }
+
+    #[test]
+    fn retained_root_geometry_opaque_owners_stay_opaque() {
+        let bytes = ByteBuffer::from(Bytes::from_static(b"opaque"));
+        assert_eq!(
+            bytes.retained_root_geometry(),
+            RetainedRootGeometry::OpaqueBytes
+        );
+        assert_eq!(
+            bytes.slice_unaligned(0..0).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        let mut cleared = bytes.clone();
+        cleared.clear();
+        assert_eq!(
+            cleared.retained_root_geometry(),
+            RetainedRootGeometry::OpaqueBytes
+        );
+        let external = Buffer::from(vec![String::from("external")]);
+        assert_eq!(
+            external.retained_root_geometry(),
+            RetainedRootGeometry::OpaqueExternal
+        );
+        assert_eq!(
+            external.slice(0..0).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        let mut cleared = external.clone();
+        cleared.clear();
+        assert_eq!(
+            cleared.retained_root_geometry(),
+            RetainedRootGeometry::OpaqueExternal
+        );
+    }
+
+    #[test]
+    fn retained_root_geometry_does_not_clone_ownership() {
+        let buffer = ByteBuffer::from(vec![17_u8; 32]);
+        let backing = buffer.backing.as_ref().unwrap();
+        let count = Arc::strong_count(backing);
+        for _ in 0..32 {
+            assert!(matches!(
+                buffer.retained_root_geometry(),
+                RetainedRootGeometry::ExactOwned { .. }
+            ));
+            assert_eq!(Arc::strong_count(backing), count);
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn retained_root_geometry_arrow_reports_declared_root() {
+        let mut values = Vec::with_capacity(1024);
+        values.extend_from_slice(&[19_u8; 32]);
+        let arrow = arrow_buffer::Buffer::from_vec(values);
+        let expected = RetainedRootGeometry::ArrowDeclared {
+            data_start: arrow.data_ptr().as_ptr() as usize,
+            capacity: arrow.capacity(),
+        };
+        let buffer = ByteBuffer::from_arrow_buffer(arrow.clone(), Alignment::none());
+        let count = arrow.strong_count();
+        assert_eq!(buffer.retained_root_geometry(), expected);
+        assert_eq!(
+            buffer.slice_unaligned(8..16).retained_root_geometry(),
+            expected
+        );
+        assert_eq!(
+            buffer.slice_unaligned(16..16).retained_root_geometry(),
+            RetainedRootGeometry::Empty
+        );
+        {
+            let mut cleared = buffer.clone();
+            cleared.clear();
+            assert_eq!(cleared.retained_root_geometry(), expected);
+        }
+        assert_eq!(arrow.strong_count(), count);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn retained_root_geometry_custom_arrow_is_not_exact_owned() {
+        struct OpaqueOwner(Vec<u8>);
+        impl AsRef<[u8]> for OpaqueOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0[8..24]
+            }
+        }
+        let arrow = arrow_buffer::Buffer::from(Bytes::from_owner(OpaqueOwner(vec![23; 4096])));
+        let expected = RetainedRootGeometry::ArrowDeclared {
+            data_start: arrow.data_ptr().as_ptr() as usize,
+            capacity: 16,
+        };
+        let buffer = ByteBuffer::from_arrow_buffer(arrow, Alignment::none());
+        assert_eq!(buffer.retained_root_geometry(), expected);
+    }
 
     #[test]
     fn align() {
