@@ -115,11 +115,14 @@ fn with_max_tables(max_tables: usize) -> VerifierOptions {
 }
 
 fn is_too_many_tables(error: &VortexError) -> bool {
-    match error {
-        VortexError::FlatBuffers(InvalidFlatbuffer::TooManyTables, _) => true,
-        VortexError::Context(_, inner) => is_too_many_tables(inner),
-        _ => false,
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(flatbuffer) = error.downcast_ref::<InvalidFlatbuffer>() {
+            return matches!(flatbuffer, InvalidFlatbuffer::TooManyTables);
+        }
+        source = error.source();
     }
+    false
 }
 
 #[test]
