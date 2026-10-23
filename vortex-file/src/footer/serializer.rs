@@ -3,15 +3,24 @@
 
 use std::sync::Arc;
 
+use flatbuffers::Follow;
+use flatbuffers::Verifiable;
+use flatbuffers::VerifierOptions;
+use flatbuffers::root_with_opts;
+
+use vortex_array::flatbuffers::FILE_METADATA_VERIFIER_OPTIONS;
 use vortex_array::flatbuffers::FlatBuffer;
 use vortex_array::flatbuffers::FlatBufferRoot;
 use vortex_array::flatbuffers::WriteFlatBuffer;
 use vortex_array::flatbuffers::WriteFlatBufferExt;
+use vortex_array::flatbuffers::dtype as fbd;
 use vortex_buffer::ByteBuffer;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_layout::LayoutContext;
+use vortex_layout::flatbuffers::layout as fbl;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -25,6 +34,7 @@ use crate::footer::SegmentSpec;
 use crate::footer::file_layout::FooterFlatBufferWriter;
 use crate::footer::postscript::Postscript;
 use crate::footer::postscript::PostscriptMetadata;
+use crate::flatbuffers::footer as fb;
 use crate::footer::postscript::PostscriptSegment;
 
 /// Serializes a [`Footer`] into footer buffers and the trailing postscript/EOF marker.
@@ -35,6 +45,7 @@ pub struct FooterSerializer {
     offset: u64,
     layout_ctx: LayoutContext,
     session: VortexSession,
+    verifier_options: VerifierOptions,
 }
 
 impl FooterSerializer {
@@ -46,7 +57,16 @@ impl FooterSerializer {
             offset: 0,
             layout_ctx: LayoutContext::default(),
             session,
+            verifier_options: FILE_METADATA_VERIFIER_OPTIONS,
         }
+    }
+
+    /// Verify serialized metadata flatbuffers with `options` instead of
+    /// [`FILE_METADATA_VERIFIER_OPTIONS`], so tests can exercise the limits with small files.
+    #[cfg(test)]
+    pub(crate) fn with_verifier_options(mut self, options: VerifierOptions) -> Self {
+        self.verifier_options = options;
+        self
     }
 
     /// Serialize layouts through `layout_ctx`.
@@ -134,6 +154,7 @@ impl FooterSerializer {
             None
         } else {
             let (buffer, dtype_segment) = write_flatbuffer(&mut self.offset, self.footer.dtype())?;
+            verify_readable::<fbd::DType>(&self.verifier_options, "dtype", &buffer)?;
             buffers.push(buffer);
             Some(dtype_segment)
         };
@@ -149,6 +170,7 @@ impl FooterSerializer {
                 .layout()
                 .flatbuffer_writer(&layout_ctx, &self.session),
         )?;
+        verify_readable::<fbl::Layout>(&self.verifier_options, "layout", &buffer)?;
         buffers.push(buffer);
 
         let statistics_segment = match self.footer.statistics() {
@@ -156,6 +178,11 @@ impl FooterSerializer {
             Some(stats) if stats.is_empty() => None,
             Some(stats) => {
                 let (buffer, stats_segment) = write_flatbuffer(&mut self.offset, stats)?;
+                verify_readable::<fb::FileStatistics>(
+                    &self.verifier_options,
+                    "file statistics",
+                    &buffer,
+                )?;
                 buffers.push(buffer);
                 Some(stats_segment)
             }
@@ -169,6 +196,7 @@ impl FooterSerializer {
                 segment_specs: Arc::clone(&self.footer.segments),
             },
         )?;
+        verify_readable::<fb::Footer>(&self.verifier_options, "footer", &buffer)?;
         buffers.push(buffer);
 
         // Assemble the postscript, and write it manually to avoid any framing.
@@ -180,6 +208,11 @@ impl FooterSerializer {
             metadata: metadata_segments,
         };
         let postscript_buffer = postscript.write_flatbuffer_bytes()?;
+        verify_readable::<fb::Postscript>(
+            &self.verifier_options,
+            "postscript",
+            &postscript_buffer,
+        )?;
         if postscript_buffer.len() > MAX_POSTSCRIPT_SIZE as usize {
             Err(vortex_err!(
                 "Postscript is too large ({} bytes); max postscript size is {}",
@@ -203,6 +236,32 @@ impl FooterSerializer {
             buffers.iter().map(ByteBuffer::len).sum::<usize>() - metadata_storage_bytes;
         Ok((buffers, metadata_locators.into(), approx_byte_size))
     }
+}
+
+/// Fails the write when readers would reject a serialized metadata flatbuffer.
+///
+/// Writers use [`FILE_METADATA_VERIFIER_OPTIONS`]. Readers verify each metadata flatbuffer with
+/// options that are never stricter, so a buffer that passes here can be opened. The footer is
+/// serialized after every data segment and before the file is finished, so a rejected buffer fails
+/// the write before the file becomes readable. The returned error keeps the flatbuffers error
+/// (for example `TooManyTables`) as its source.
+fn verify_readable<'buf, T: Verifiable + Follow<'buf> + 'buf>(
+    options: &VerifierOptions,
+    name: &'static str,
+    buffer: &'buf [u8],
+) -> VortexResult<()> {
+    root_with_opts::<T>(options, buffer)
+        .map(drop)
+        .map_err(|error| {
+            VortexError::from(error).with_context(format!(
+                "Vortex readers would reject the {name} flatbuffer ({} bytes; limits: {} tables, \
+                 depth {}, apparent size {} bytes)",
+                buffer.len(),
+                options.max_tables,
+                options.max_depth,
+                options.max_apparent_size,
+            ))
+        })
 }
 
 impl From<&PostscriptSegment> for SegmentSpec {
