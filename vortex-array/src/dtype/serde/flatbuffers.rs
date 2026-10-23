@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use flatbuffers::FlatBufferBuilder;
 use flatbuffers::Follow;
+use flatbuffers::VerifierOptions;
 use flatbuffers::WIPOffset;
-use flatbuffers::root;
+use flatbuffers::root_with_opts;
 use itertools::Itertools;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
@@ -167,8 +168,17 @@ impl MapDType {
 impl DType {
     /// Create a [`DType`] from a flatbuffer buffer.
     pub fn from_flatbuffer(buffer: FlatBuffer, session: &VortexSession) -> VortexResult<Self> {
+        Self::from_flatbuffer_with_opts(buffer, session, &VerifierOptions::default())
+    }
+
+    /// Create a [`DType`] from a flatbuffer buffer verified with `opts`.
+    pub fn from_flatbuffer_with_opts(
+        buffer: FlatBuffer,
+        session: &VortexSession,
+        opts: &VerifierOptions,
+    ) -> VortexResult<Self> {
         let fb_loc = {
-            let fb_dtype = root::<fbd::DType>(&buffer)?;
+            let fb_dtype = root_with_opts::<fbd::DType>(opts, &buffer)?;
             fb_dtype._tab.loc()
         };
         let view = ViewedDType::from_fb_loc(fb_loc, buffer, session.clone());
