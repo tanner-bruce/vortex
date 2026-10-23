@@ -40,6 +40,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ZstdBuffersMetadata;
+use crate::array::with_thread_decompressor;
 use crate::validate_frame_content_size;
 
 /// A [`ZstdBuffers`]-encoded Vortex array.
@@ -247,7 +248,13 @@ impl ZstdBuffersData {
     fn decompress_buffers(&self) -> VortexResult<Vec<BufferHandle>> {
         // CPU decode path: zstd::bulk works on host bytes, so compressed buffers are
         // materialized on the host via `try_to_host_sync`.
-        let mut decompressor = zstd::bulk::Decompressor::new()?;
+        with_thread_decompressor(|decompressor| self.decompress_buffers_with(decompressor))
+    }
+
+    fn decompress_buffers_with(
+        &self,
+        decompressor: &mut zstd::bulk::Decompressor<'_>,
+    ) -> VortexResult<Vec<BufferHandle>> {
         let mut result = Vec::with_capacity(self.compressed_buffers.len());
         for (i, (buf, &uncompressed_size)) in self
             .compressed_buffers

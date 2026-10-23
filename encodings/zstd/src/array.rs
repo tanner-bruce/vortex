@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::cell::RefCell;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -711,6 +712,52 @@ fn slice_views(
     Ok(views.slice(range))
 }
 
+thread_local! {
+    /// One dictionary-free decompression context per thread. `ZSTD_createDCtx` allocates and
+    /// initializes a 94 KiB context, and creating one per slice decode showed up in compaction
+    /// profiles. Every frame starts by resetting the context, and one without a dictionary
+    /// carries no other state between frames, so reusing it gives the same output.
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+/// Runs `f` with this thread's dictionary-free decompression context, creating it on first use.
+pub(crate) fn with_thread_decompressor<R>(
+    f: impl FnOnce(&mut zstd::bulk::Decompressor<'static>) -> VortexResult<R>,
+) -> VortexResult<R> {
+    DECOMPRESSOR.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            // Nested use is not expected; if it happens, the inner call gets its own context
+            // rather than panicking.
+            return f(&mut zstd::bulk::Decompressor::new()?);
+        };
+        let decompressor = match &mut *slot {
+            Some(decompressor) => decompressor,
+            empty @ None => empty.insert(zstd::bulk::Decompressor::new()?),
+        };
+        f(decompressor)
+    })
+}
+
+/// Decompresses `frames` back to back into the spare capacity of `decompressed`, returning the
+/// number of bytes written. Each frame gets only the region after the ones before it, bounded by
+/// the `total` size the metadata declared, so a frame that expands further than advertised is
+/// refused by zstd rather than overrunning.
+fn decompress_frames(
+    decompressor: &mut zstd::bulk::Decompressor<'_>,
+    frames: &[&ByteBuffer],
+    decompressed: &mut ByteBufferMut,
+    total: usize,
+) -> VortexResult<usize> {
+    let mut written = 0;
+    for frame in frames {
+        let mut destination =
+            UninitDestination::new(&mut decompressed.spare_capacity_mut()[written..total]);
+        written += decompressor.decompress_to_buffer(frame.as_slice(), &mut destination)?;
+    }
+    Ok(written)
+}
+
 /// A zstd output buffer over uninitialized spare capacity.
 ///
 /// `decompress_to_buffer` writes through a raw pointer and reports how many bytes it produced, so
@@ -1386,27 +1433,26 @@ impl ZstdData {
         }
 
         // then we actually decompress those frames
-        let mut decompressor = if let Some(dictionary) = &self.dictionary {
-            zstd::bulk::Decompressor::with_dictionary(dictionary)?
-        } else {
-            zstd::bulk::Decompressor::new()?
-        };
         let mut decompressed = ByteBufferMut::with_capacity_aligned(
             uncompressed_size_to_decompress,
             Alignment::new(byte_width),
         );
-        let mut uncompressed_start = 0;
-        for frame in frames_to_decompress {
-            // Decompress straight into the spare capacity. Each frame gets only the region after
-            // the ones before it, bounded by the size the metadata declared, so a frame that
-            // expands further than advertised is refused by zstd rather than overrunning.
-            let mut destination = UninitDestination::new(
-                &mut decompressed.spare_capacity_mut()
-                    [uncompressed_start..uncompressed_size_to_decompress],
-            );
-            uncompressed_start +=
-                decompressor.decompress_to_buffer(frame.as_slice(), &mut destination)?;
-        }
+        let uncompressed_start = match &self.dictionary {
+            Some(dictionary) => decompress_frames(
+                &mut zstd::bulk::Decompressor::with_dictionary(dictionary)?,
+                &frames_to_decompress,
+                &mut decompressed,
+                uncompressed_size_to_decompress,
+            )?,
+            None => with_thread_decompressor(|decompressor| {
+                decompress_frames(
+                    decompressor,
+                    &frames_to_decompress,
+                    &mut decompressed,
+                    uncompressed_size_to_decompress,
+                )
+            })?,
+        };
         if uncompressed_start != uncompressed_size_to_decompress {
             vortex_bail!(
                 "Zstd metadata or frames were corrupt; expected {} bytes but decompressed {}",

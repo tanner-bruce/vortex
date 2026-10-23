@@ -507,3 +507,26 @@ fn test_zstd_rejects_mismatched_frame_content_size() {
     .unwrap_err();
     assert!(error.to_string().contains("metadata declares"));
 }
+
+/// Each thread reuses one decompression context, so a frame that fails partway through must not
+/// change what the next decode on that thread returns.
+#[test]
+fn test_zstd_decodes_correctly_after_a_failed_decode_on_the_same_thread() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let values = PrimitiveArray::from_iter((0..4096_i32).map(|i| i * 7 % 1000));
+    let compressed = Zstd::from_primitive(&values, 3, 0, &mut ctx)?;
+    let mut data = compressed.data().clone();
+    let mut frame = data.frames[0].as_slice().to_vec();
+    // Keep the frame header, which carries the content size, and corrupt the blocks after it.
+    let body = frame.len() / 2;
+    for byte in &mut frame[body..] {
+        *byte = !*byte;
+    }
+    data.frames[0] = ByteBuffer::from(frame);
+    let corrupt = Zstd::try_new(values.dtype().clone(), data, Validity::NonNullable)?;
+    assert!(Zstd::decompress(&corrupt, &mut ctx).is_err());
+
+    let decompressed = Zstd::decompress(&compressed, &mut ctx)?;
+    assert_arrays_eq!(decompressed, values, &mut ctx);
+    Ok(())
+}
