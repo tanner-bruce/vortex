@@ -86,7 +86,7 @@ impl StatsCache {
 /// [`varbinview_stats`]: ArrayAndStats::varbinview_stats
 /// [`get_or_insert_with`]: ArrayAndStats::get_or_insert_with
 pub struct ArrayAndStats {
-    /// Canonical input, or a private prepared Utf8 dictionary for opted-in estimates.
+    /// Canonical input, or a private Utf8 dictionary for opted-in estimates.
     array: ArrayRef,
     /// The stats cache.
     cache: StatsCache,
@@ -115,7 +115,7 @@ impl ArrayAndStats {
         }
     }
 
-    /// Bundles a prepared dictionary with its equivalent logical string statistics.
+    /// Bundles a source or prepared dictionary with its logical string statistics.
     pub(crate) fn new_dictionary(
         array: ArrayRef,
         opts: GenerateStatsOptions,

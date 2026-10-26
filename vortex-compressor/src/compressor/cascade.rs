@@ -153,8 +153,8 @@ impl CascadingCompressor {
                     .fold(GenerateStatsOptions::default(), |opts, s| {
                         opts.merge(s.stats_options())
                     });
-                let prepared = strings::prepare_dictionary(&dict.into_owned(), opts, exec_ctx)?;
-                let data = ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
+                let prepared = strings::analyze_dictionary(&dict.into_owned(), opts, exec_ctx)?;
+                let data = ArrayAndStats::new_dictionary(array.clone(), opts, prepared.stats);
                 let mut compress_ctx = compress_ctx.with_merged_stats_options(opts);
                 compress_ctx.logical_strings = true;
                 return self
@@ -387,8 +387,8 @@ impl CascadingCompressor {
         // full array is constant.
         //
         // Compare valid values directly so even nullable constants avoid distinct-value counting.
-        let is_constant = if compress_ctx.logical_strings {
-            constant::prepared_dictionary_is_constant(data.array(), exec_ctx)?
+        let is_constant = if compress_ctx.logical_strings && data.array().is::<Dict>() {
+            constant::dictionary_is_constant(&data, exec_ctx)?
         } else {
             constant::is_constant_for_compression(data.array(), exec_ctx)?
         };
@@ -413,6 +413,15 @@ impl CascadingCompressor {
             ArrayAndStats::new(
                 strings::pack(data.array(), exec_ctx)?,
                 compress_ctx.merged_stats_options(),
+            )
+        } else if compress_ctx.logical_strings
+            && let Some(dict) = data.array().as_opt::<Dict>()
+        {
+            let stats = (*data.varbinview_stats(exec_ctx)).clone();
+            ArrayAndStats::new_dictionary(
+                strings::prepare_dictionary(&dict.into_owned(), exec_ctx)?,
+                compress_ctx.merged_stats_options(),
+                stats,
             )
         } else {
             data
