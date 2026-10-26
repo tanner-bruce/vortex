@@ -124,6 +124,16 @@ pub trait Scheme: Debug + Send + Sync {
     /// Whether this scheme can compress the given canonical array.
     fn matches(&self, canonical: &Canonical) -> bool;
 
+    /// Eligibility for an existing Utf8 dictionary without canonical expansion.
+    ///
+    /// `Some(true)` also promises that estimates accept dictionary-backed data using
+    /// string statistics, dtype and length only. Full compression receives canonical
+    /// input, except StringDict which consumes the retained dictionary. `None` keeps
+    /// the legacy canonical path for schemes that inspect physical input contents.
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        None
+    }
+
     /// The array encodings this scheme itself may introduce into its compressed output.
     ///
     /// Cascaded children are compressed by other schemes, which declare their own encodings,

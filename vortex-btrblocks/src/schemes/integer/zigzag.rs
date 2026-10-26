@@ -46,6 +46,10 @@ impl Scheme for ZigZagScheme {
         canonical.dtype().is_int()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         vec![ZigZag.id()]
     }

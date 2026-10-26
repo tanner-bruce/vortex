@@ -90,12 +90,14 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
+    string_dictionary_reuse: bool,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
     fn default() -> Self {
         Self {
             schemes: ALL_SCHEMES.to_vec(),
+            string_dictionary_reuse: false,
         }
     }
 }
@@ -107,6 +109,7 @@ impl BtrBlocksCompressorBuilder {
     pub fn empty() -> Self {
         Self {
             schemes: Vec::new(),
+            string_dictionary_reuse: false,
         }
     }
 
@@ -210,9 +213,18 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Enables packed Utf8 samples and reuse of existing UInt32 string dictionaries.
+    pub fn with_string_dictionary_reuse(mut self, enabled: bool) -> Self {
+        self.string_dictionary_reuse = enabled;
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
+        BtrBlocksCompressor(
+            CascadingCompressor::new(self.schemes)
+                .with_string_dictionary_reuse(self.string_dictionary_reuse),
+        )
     }
 }
 

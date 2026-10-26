@@ -15,7 +15,9 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::aggregate_fn::fns::is_constant::is_constant;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::MaskedArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
@@ -45,6 +47,11 @@ pub(crate) fn is_constant_for_compression(
     data: &ArrayAndStats,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<bool> {
+    if let Some(dict) = data.array().as_opt::<Dict>() {
+        // Prepared dictionaries contain unique referenced valid values only. Match the
+        // canonical string check, which rejects mixed-null arrays as constant.
+        return Ok(dict.values().len() == 1 && data.varbinview_stats(exec_ctx).null_count() == 0);
+    }
     let dtype = data.array().dtype();
 
     if matches!(dtype, DType::Bool(_)) {

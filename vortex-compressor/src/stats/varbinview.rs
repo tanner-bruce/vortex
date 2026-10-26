@@ -44,6 +44,19 @@ fn estimate_distinct_count(varbinview: &VarBinViewArray) -> VortexResult<u32> {
 }
 
 impl StringStats {
+    /// Builds statistics from referenced dictionary codes without expanded views.
+    pub(crate) fn from_dictionary_counts(
+        value_count: usize,
+        null_count: usize,
+        estimated_distinct_count: Option<usize>,
+    ) -> VortexResult<Self> {
+        Ok(Self {
+            value_count: value_count.try_into()?,
+            null_count: null_count.try_into()?,
+            estimated_distinct_count: estimated_distinct_count.map(u32::try_from).transpose()?,
+        })
+    }
+
     /// Generates stats, returning an error on failure.
     fn generate_opts_fallible(
         input: &VarBinViewArray,

@@ -165,6 +165,11 @@ pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
         canonical.into_array()
     };
 
+    let sample_array = if compress_ctx.logical_strings && sample_array.dtype().is_utf8() {
+        super::strings::pack(&sample_array, exec_ctx)?
+    } else {
+        sample_array
+    };
     let sample_data = ArrayAndStats::new(sample_array, scheme.stats_options());
     let error_ctx = trace::enabled_error_context(&compress_ctx);
     let sample_ctx = compress_ctx.with_sampling();

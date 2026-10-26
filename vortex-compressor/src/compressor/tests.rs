@@ -12,9 +12,12 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::Constant;
+use vortex_array::arrays::Dict;
+use vortex_array::arrays::DictArray;
 use vortex_array::arrays::Map;
 use vortex_array::arrays::NullArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::builders::MapBuilder;
 use vortex_array::dtype::DType;
@@ -843,5 +846,83 @@ fn map_compression_preserves_repeated_entry_children() -> VortexResult<()> {
     assert!(compressed.is::<Map>());
     assert_eq!(compressed.dtype(), array.dtype());
     assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CanonicalStringScheme;
+
+impl Scheme for CanonicalStringScheme {
+    fn scheme_name(&self) -> &'static str {
+        "test.canonical_string"
+    }
+    fn matches(&self, canonical: &Canonical) -> bool {
+        canonical.dtype().is_utf8()
+    }
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![]
+    }
+    fn expected_compression_ratio(
+        &self,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        assert_eq!(data.array_as_varbinview().len(), data.array_len());
+        CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse)
+    }
+    fn compress(
+        &self,
+        _: &CascadingCompressor,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        Ok(data.array().clone())
+    }
+}
+
+#[test]
+fn dictionary_reuse_preserves_external_canonical_scheme_fallback() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let dict = DictArray::try_new(
+        PrimitiveArray::from_iter((0..4096).map(|i| i % 2_u32)).into_array(),
+        VarBinViewArray::from_iter_str(["first repeated long value", "second repeated long value"])
+            .into_array(),
+    )?
+    .into_array();
+    let legacy = CascadingCompressor::new(vec![&CanonicalStringScheme]);
+    let expected = legacy.compress(&dict, &mut ctx)?;
+    let actual = legacy
+        .with_string_dictionary_reuse(true)
+        .compress(&dict, &mut ctx)?;
+    assert_eq!(actual.nbytes(), expected.nbytes());
+    assert_arrays_eq!(&expected, &actual, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn dictionary_reuse_keeps_high_cardinality_gate_and_cascade_limits() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = compressor().with_string_dictionary_reuse(true);
+    let values = VarBinViewArray::from_iter(
+        (0..100).map(|i| Some(format!("{i:04} distinct string"))),
+        DType::Utf8(Nullability::NonNullable),
+    )
+    .into_array();
+    let unique = DictArray::try_new(PrimitiveArray::from_iter(0..100_u32).into_array(), values)?
+        .into_array();
+    let output = compressor.compress(&unique, &mut ctx)?;
+    assert!(!output.is::<Dict>());
+    assert_arrays_eq!(&unique, &output, &mut ctx);
+    let limited = compressor.compress_child(
+        &unique,
+        &CompressorContext::new().as_leaf(),
+        StringDictScheme.id(),
+        0,
+        &mut ctx,
+    )?;
+    assert!(limited.is::<Dict>());
+    assert_arrays_eq!(&unique, &limited, &mut ctx);
     Ok(())
 }

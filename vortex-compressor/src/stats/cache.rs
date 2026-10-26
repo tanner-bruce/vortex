@@ -86,7 +86,7 @@ impl StatsCache {
 /// [`varbinview_stats`]: ArrayAndStats::varbinview_stats
 /// [`get_or_insert_with`]: ArrayAndStats::get_or_insert_with
 pub struct ArrayAndStats {
-    /// The array. This is always in canonical form.
+    /// Canonical input, or a private prepared Utf8 dictionary for opted-in estimates.
     array: ArrayRef,
     /// The stats cache.
     cache: StatsCache,
@@ -115,7 +115,21 @@ impl ArrayAndStats {
         }
     }
 
+    /// Bundles a prepared dictionary with its equivalent logical string statistics.
+    pub(crate) fn new_dictionary(
+        array: ArrayRef,
+        opts: GenerateStatsOptions,
+        stats: StringStats,
+    ) -> Self {
+        let cache = StatsCache::new();
+        cache.get_or_insert_with(|| stats);
+        Self { array, cache, opts }
+    }
+
     /// Returns a reference to the array.
+    ///
+    /// In an opted-in string dictionary estimate this may be a Dict array. Schemes
+    /// that require canonical contents must leave dictionary eligibility unknown.
     pub fn array(&self) -> &ArrayRef {
         &self.array
     }
