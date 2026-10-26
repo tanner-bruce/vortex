@@ -143,7 +143,11 @@ pub(super) fn prepare_dictionary(
     let validity = Validity::from_bit_buffer(validity.freeze(), dict.dtype().nullability());
     let codes = PrimitiveArray::new(Buffer::from(output_codes), validity).into_array();
     let values = output_values.finish_into_varbinview().into_array();
-    let array = DictArray::try_new(codes, values)?.into_array();
+    // SAFETY: a value is appended only when a valid input code first references its bytes.
+    // That same iteration appends the translated valid output code. Deduplication only
+    // reuses such an existing value; null input codes/values never append output values.
+    let array =
+        unsafe { DictArray::try_new(codes, values)?.set_all_values_referenced(true) }.into_array();
     Ok(PreparedDictionary {
         array,
         stats: StringStats::from_dictionary_counts(
@@ -260,7 +264,8 @@ mod tests {
         );
         let dict = prepared.array.as_::<Dict>();
         assert_eq!(dict.values().len(), 2);
-        assert!(!dict.has_all_values_referenced());
+        assert!(dict.has_all_values_referenced());
+        dict.validate_all_values_referenced(&mut ctx)?;
         assert_eq!(
             dict.codes().dtype().as_ptype(),
             vortex_array::dtype::PType::U32
@@ -293,6 +298,9 @@ mod tests {
                     prepare_dictionary(&input.as_::<Dict>().into_owned(), opts, &mut ctx)?;
                 let packed = pack(&input, &mut ctx)?;
                 assert_arrays_eq!(&packed, &prepared.array, &mut ctx);
+                let prepared_dict = prepared.array.as_::<Dict>();
+                assert!(prepared_dict.has_all_values_referenced());
+                prepared_dict.validate_all_values_referenced(&mut ctx)?;
                 assert_eq!(prepared.packed_nbytes, logical_nbytes(&packed, &mut ctx)?);
             }
         }
