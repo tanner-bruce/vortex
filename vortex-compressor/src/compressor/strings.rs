@@ -29,6 +29,8 @@ use crate::stats::StringStats;
 
 /// Logical selection facts, computed without rebuilding values or codes.
 pub(super) struct DictionaryAnalysis {
+    /// Source codes and canonical values shared by all trials at this compression site.
+    pub array: ArrayRef,
     /// Full-input statistics for the existing string estimator.
     pub stats: StringStats,
     /// Size of densely packed canonical logical strings.
@@ -119,7 +121,11 @@ pub(super) fn analyze_dictionary(
     if opts.count_distinct_values && null_count > 0 {
         prefixes.insert(0);
     }
+    // Keep the canonical value views once: Arrow offset strings otherwise rebuild
+    // the same view buffer independently for analysis, each sample, and fallback.
+    let array = DictArray::try_new(codes.into_array(), values.into_array())?.into_array();
     Ok(DictionaryAnalysis {
+        array,
         stats: StringStats::from_dictionary_counts(
             dict.len() - null_count,
             null_count,

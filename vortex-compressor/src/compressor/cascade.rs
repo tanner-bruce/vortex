@@ -134,7 +134,7 @@ impl CascadingCompressor {
                         opts.merge(s.stats_options())
                     });
                 let prepared = strings::analyze_dictionary(&dict.into_owned(), opts, exec_ctx)?;
-                let data = ArrayAndStats::new_dictionary(array.clone(), opts, prepared.stats);
+                let data = ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
                 let mut compress_ctx = compress_ctx.with_merged_stats_options(opts);
                 compress_ctx.logical_strings = true;
                 return self.choose_prepared(
