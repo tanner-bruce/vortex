@@ -23,6 +23,8 @@ pub const MAX_CASCADE: usize = 3;
 pub struct CompressorContext {
     /// Whether we're compressing a sample (for ratio estimation).
     is_sample: bool,
+    /// Compare Utf8 candidates using packed logical strings.
+    pub(crate) logical_strings: bool,
 
     /// Remaining cascade depth allowed.
     allowed_cascading: usize,
@@ -47,6 +49,7 @@ impl CompressorContext {
     pub(crate) fn new() -> Self {
         Self {
             is_sample: false,
+            logical_strings: false,
             allowed_cascading: MAX_CASCADE,
             merged_stats_options: GenerateStatsOptions::default(),
             cascade_history: Vec::new(),

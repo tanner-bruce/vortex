@@ -87,6 +87,10 @@ impl Scheme for DecimalScheme {
         matches!(canonical, Canonical::Decimal(_))
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         match self.mode {
             DecimalSchemeMode::V1 => vec![decimal_byte_parts_v1_id()],

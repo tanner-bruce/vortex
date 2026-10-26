@@ -42,6 +42,10 @@ impl Scheme for NullDominatedSparseScheme {
         canonical.dtype().is_utf8()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         vec![Sparse.id()]
     }

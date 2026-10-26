@@ -50,6 +50,10 @@ impl Scheme for FSSTScheme {
         canonical.dtype().is_utf8() || canonical.dtype().is_binary()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         vec![FSST.id(), VarBin.id()]
     }

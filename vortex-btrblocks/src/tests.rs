@@ -21,11 +21,14 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::fns::sum::sum;
 use vortex_array::arrays::DecimalArray;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::listview::ListViewArraySlotsExt;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
@@ -45,6 +48,7 @@ use vortex_edition::EditionSessionExt;
 use vortex_edition::declarations::core::CORE_2026_08_3;
 use vortex_error::VortexResult;
 use vortex_fastlanes::Delta;
+#[cfg(feature = "zstd")]
 use vortex_session::VortexSession;
 
 use crate::BtrBlocksCompressor;
@@ -197,5 +201,113 @@ fn test_cuda_binary_zstd_follows_editions(
     let compressed = assert_roundtrip(&compressor, &input)?;
     assert_eq!(compressed.encoding_id(), expected);
 
+    Ok(())
+}
+
+/// Reusing an existing Utf8 dictionary must select the same encoding as compressing the
+/// equivalent flat strings, across sample strides and value lengths.
+#[test]
+fn dictionary_reuse_matches_flat_selection_across_sample_strides() -> VortexResult<()> {
+    use vortex_array::arrays::DictArray;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = BtrBlocksCompressorBuilder::default()
+        .with_string_dictionary_reuse(true)
+        .build();
+    for stride in [1, 20, 100, 200, 1000] {
+        for length in [8, 48, 1024] {
+            let values: Vec<String> = (1..=16)
+                .map(|seed| {
+                    let mut state = seed as u64;
+                    (0..length)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            char::from(b'!' + (state % 90) as u8)
+                        })
+                        .collect()
+                })
+                .collect();
+            let flat = VarBinViewArray::from_iter(
+                (0..8192).map(|i| {
+                    (i % stride == 0).then(|| values[(i / stride) % 16].as_str())
+                }),
+                DType::Utf8(Nullability::Nullable),
+            )
+            .into_array();
+            let codes = PrimitiveArray::from_option_iter((0..8192).map(|i| {
+                (i % stride == 0).then_some(
+                    u32::try_from((i / stride) % 16).expect("16 dictionary values"),
+                )
+            }))
+            .into_array();
+            let dict = DictArray::try_new(
+                codes,
+                VarBinViewArray::from_iter_str(values).into_array(),
+            )?
+            .into_array();
+            let a = compressor.compress(&flat, &mut ctx)?;
+            let b = compressor.compress(&dict, &mut ctx)?;
+            assert_arrays_eq!(&flat, &b, &mut ctx);
+            assert_arrays_eq!(&a, &b, &mut ctx);
+            assert_eq!(
+                a.encoding_id(),
+                b.encoding_id(),
+                "stride={stride} length={length}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reuse recurses into struct and list children, preserving their dictionaries.
+#[test]
+fn dictionary_reuse_recurses_into_struct_lists() -> VortexResult<()> {
+    use vortex_array::arrays::DictArray;
+    use vortex_array::arrays::ListViewArray;
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let dictionary = DictArray::try_new(
+        PrimitiveArray::from_iter((0..4096).map(|i| i % 2_u32)).into_array(),
+        VarBinViewArray::from_iter_str([
+            "first repeated long value",
+            "second repeated long value",
+            "unused",
+        ])
+        .into_array(),
+    )?
+    .into_array();
+    let input = ListArray::try_new(
+        StructArray::try_new(
+            ["value"].into(),
+            vec![dictionary],
+            4096,
+            Validity::NonNullable,
+        )?
+        .into_array(),
+        PrimitiveArray::from_iter([0_u32, 2048, 4096]).into_array(),
+        Validity::NonNullable,
+        &mut ctx,
+    )?
+    .into_array();
+    let compressor = BtrBlocksCompressorBuilder::empty()
+        .with_new_scheme(&crate::schemes::string::StringDictScheme)
+        .with_string_dictionary_reuse(true)
+        .build();
+    let output = compressor.compress(&input, &mut ctx)?;
+    assert_arrays_eq!(&input, &output, &mut ctx);
+    let list = output.execute::<ListViewArray>(&mut ctx)?;
+    let entries = list.elements().clone().execute::<StructArray>(&mut ctx)?;
+    assert!(entries.unmasked_field(0).is::<Dict>());
+
+    let fallback = BtrBlocksCompressorBuilder::empty()
+        .with_string_dictionary_reuse(true)
+        .build()
+        .compress(&input, &mut ctx)?;
+    assert_arrays_eq!(&input, &fallback, &mut ctx);
+    let list = fallback.execute::<ListViewArray>(&mut ctx)?;
+    let entries = list.elements().clone().execute::<StructArray>(&mut ctx)?;
+    assert!(!entries.unmasked_field(0).is::<Dict>());
     Ok(())
 }

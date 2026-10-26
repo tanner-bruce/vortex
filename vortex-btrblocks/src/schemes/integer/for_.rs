@@ -110,6 +110,10 @@ impl Scheme for FoRScheme {
         canonical.dtype().is_int()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         let mut encodings = match self.mode {
             FoRSchemeMode::V1 => vec![for_v1_id()],
