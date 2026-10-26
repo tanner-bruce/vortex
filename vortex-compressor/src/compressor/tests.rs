@@ -926,3 +926,29 @@ fn dictionary_reuse_keeps_high_cardinality_gate_and_cascade_limits() -> VortexRe
     assert_arrays_eq!(&unique, &limited, &mut ctx);
     Ok(())
 }
+
+#[test]
+fn dictionary_reuse_detects_constants_from_referenced_values() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = CascadingCompressor::new(Vec::new()).with_string_dictionary_reuse(true);
+    for (values, codes, constant) in [
+        (
+            vec![Some("unused"), Some("same"), Some("same")],
+            vec![Some(1_u32), Some(2)],
+            true,
+        ),
+        (vec![Some("same"), None], vec![Some(0), Some(1)], false),
+        (vec![Some("same")], vec![Some(0), None], false),
+        (vec![Some("unused"), None], vec![Some(1), None], true),
+    ] {
+        let source = DictArray::try_new(
+            PrimitiveArray::from_option_iter(codes).into_array(),
+            VarBinViewArray::from_iter_nullable_str(values).into_array(),
+        )?
+        .into_array();
+        let output = compressor.compress(&source, &mut ctx)?;
+        assert_eq!(output.is::<Constant>(), constant);
+        assert_arrays_eq!(&source, &output, &mut ctx);
+    }
+    Ok(())
+}

@@ -27,10 +27,8 @@ use vortex_utils::aliases::hash_set::HashSet;
 use crate::stats::GenerateStatsOptions;
 use crate::stats::StringStats;
 
-/// Referenced unique values, translated UInt32 codes, and logical selection facts.
-pub(super) struct PreparedDictionary {
-    /// Compact dictionary independent of source buffers.
-    pub array: ArrayRef,
+/// Logical selection facts, computed without rebuilding values or codes.
+pub(super) struct DictionaryAnalysis {
     /// Full-input statistics for the existing string estimator.
     pub stats: StringStats,
     /// Size of densely packed canonical logical strings.
@@ -62,12 +60,80 @@ fn packed_nbytes(len: usize, outlined: u64, null_count: usize) -> VortexResult<u
         .ok_or_else(|| vortex_err!("Packed string byte size overflow"))
 }
 
-/// Reconciles referenced values and effective nulls before adaptive selection.
-pub(super) fn prepare_dictionary(
+/// Counts effective nulls and the existing view prefixes before adaptive selection.
+pub(super) fn analyze_dictionary(
     dict: &DictArray,
     opts: GenerateStatsOptions,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<PreparedDictionary> {
+) -> VortexResult<DictionaryAnalysis> {
+    let _phase = tracing::debug_span!("dictionary_analyze").entered();
+    let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
+    let values = dict.values().clone().execute::<VarBinViewArray>(ctx)?;
+    let code_mask = codes.validity()?.execute_mask(codes.len(), ctx)?;
+    let value_mask = values.validity()?.execute_mask(values.len(), ctx)?;
+    let mut seen = vec![
+        false;
+        if opts.count_distinct_values {
+            values.len()
+        } else {
+            0
+        }
+    ];
+    let mut prefixes = HashSet::with_capacity(if opts.count_distinct_values {
+        values.len().min(dict.len() / 2)
+    } else {
+        0
+    });
+    let mut null_count = 0;
+    let mut outlined = 0_u64;
+    for (&code, code_valid) in codes.as_slice::<u32>().iter().zip(code_mask.iter()) {
+        if !code_valid {
+            null_count += 1;
+            continue;
+        }
+        let slot = code as usize;
+        if slot >= values.len() {
+            return Err(vortex_err!(
+                "String dictionary code {code} is out of bounds"
+            ));
+        }
+        if !value_mask.value(slot) {
+            null_count += 1;
+            continue;
+        }
+        let view = &values.views()[slot];
+        if !view.is_inlined() {
+            outlined = outlined
+                .checked_add(u64::from(view.as_view().size))
+                .ok_or_else(|| vortex_err!("Packed string byte size overflow"))?;
+        }
+        if opts.count_distinct_values && !seen[slot] {
+            seen[slot] = true;
+            let prefix = view.as_u128().to_le_bytes();
+            prefixes.insert(u64::from_le_bytes([
+                prefix[0], prefix[1], prefix[2], prefix[3], prefix[4], prefix[5], prefix[6],
+                prefix[7],
+            ]));
+        }
+    }
+    if opts.count_distinct_values && null_count > 0 {
+        prefixes.insert(0);
+    }
+    Ok(DictionaryAnalysis {
+        stats: StringStats::from_dictionary_counts(
+            dict.len() - null_count,
+            null_count,
+            opts.count_distinct_values.then_some(prefixes.len()),
+        )?,
+        packed_nbytes: packed_nbytes(dict.len(), outlined, null_count)?,
+    })
+}
+
+/// Rebuilds referenced unique values only after the dictionary scheme wins.
+pub(super) fn prepare_dictionary(
+    dict: &DictArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
     let _phase = tracing::debug_span!("dictionary_prepare").entered();
     let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
     let values = dict.values().clone().execute::<VarBinViewArray>(ctx)?;
@@ -83,48 +149,26 @@ pub(super) fn prepare_dictionary(
     );
     let mut output_codes = Vec::with_capacity(dict.len());
     let mut validity = BitBufferMut::with_capacity(dict.len());
-    let mut prefixes = HashSet::with_capacity(if opts.count_distinct_values {
-        values.len().min(dict.len() / 2)
-    } else {
-        0
-    });
-    let mut null_count = 0;
-    let mut outlined = 0_u64;
     for (&code, code_valid) in codes.as_slice::<u32>().iter().zip(code_mask.iter()) {
-        let slot = code as usize;
         if !code_valid {
-            null_count += 1;
             output_codes.push(0);
             validity.append(false);
             continue;
         }
+        let slot = code as usize;
         if slot >= values.len() {
             return Err(vortex_err!(
                 "String dictionary code {code} is out of bounds"
             ));
         }
         if !value_mask.value(slot) {
-            null_count += 1;
             output_codes.push(0);
             validity.append(false);
             continue;
         }
-        let view = &values.views()[slot];
-        if !view.is_inlined() {
-            outlined = outlined
-                .checked_add(u64::from(view.as_view().size))
-                .ok_or_else(|| vortex_err!("Packed string byte size overflow"))?;
-        }
         let translated = match translations[slot] {
             Some(translated) => translated,
             None => {
-                if opts.count_distinct_values {
-                    let prefix = view.as_u128().to_le_bytes();
-                    prefixes.insert(u64::from_le_bytes([
-                        prefix[0], prefix[1], prefix[2], prefix[3], prefix[4], prefix[5],
-                        prefix[6], prefix[7],
-                    ]));
-                }
                 let bytes = value_bytes(&values, slot);
                 let next = u32::try_from(lookup.len())?;
                 let translated = *lookup.entry(bytes).or_insert_with(|| {
@@ -138,26 +182,13 @@ pub(super) fn prepare_dictionary(
         output_codes.push(translated);
         validity.append(true);
     }
-    if opts.count_distinct_values && null_count > 0 {
-        prefixes.insert(0);
-    }
     let validity = Validity::from_bit_buffer(validity.freeze(), dict.dtype().nullability());
     let codes = PrimitiveArray::new(Buffer::from(output_codes), validity).into_array();
     let values = output_values.finish_into_varbinview().into_array();
     // SAFETY: a value is appended only when a valid input code first references its bytes.
     // That same iteration appends the translated valid output code. Deduplication only
     // reuses such an existing value; null input codes/values never append output values.
-    let array =
-        unsafe { DictArray::try_new(codes, values)?.set_all_values_referenced(true) }.into_array();
-    Ok(PreparedDictionary {
-        array,
-        stats: StringStats::from_dictionary_counts(
-            dict.len() - null_count,
-            null_count,
-            opts.count_distinct_values.then_some(prefixes.len()),
-        )?,
-        packed_nbytes: packed_nbytes(dict.len(), outlined, null_count)?,
-    })
+    Ok(unsafe { DictArray::try_new(codes, values)?.set_all_values_referenced(true) }.into_array())
 }
 
 /// Packs selected logical strings, dropping unrelated buffers and invalid view payloads.
@@ -252,19 +283,20 @@ mod tests {
         let opts = GenerateStatsOptions {
             count_distinct_values: true,
         };
-        let prepared = prepare_dictionary(&dict, opts, &mut ctx)?;
-        assert_arrays_eq!(&dict.clone().into_array(), &prepared.array, &mut ctx);
+        let facts = analyze_dictionary(&dict, opts, &mut ctx)?;
+        let prepared = prepare_dictionary(&dict, &mut ctx)?;
+        assert_arrays_eq!(&dict.clone().into_array(), &prepared, &mut ctx);
         let packed = pack(&dict.into_array(), &mut ctx)?;
-        assert_eq!(prepared.packed_nbytes, logical_nbytes(&packed, &mut ctx)?);
+        assert_eq!(facts.packed_nbytes, logical_nbytes(&packed, &mut ctx)?);
         let canonical = packed.as_::<VarBinView>().into_owned();
         let stats = StringStats::generate_opts(&canonical, opts, &mut ctx);
-        assert_eq!(prepared.stats.value_count(), stats.value_count());
-        assert_eq!(prepared.stats.null_count(), stats.null_count());
+        assert_eq!(facts.stats.value_count(), stats.value_count());
+        assert_eq!(facts.stats.null_count(), stats.null_count());
         assert_eq!(
-            prepared.stats.estimated_distinct_count(),
+            facts.stats.estimated_distinct_count(),
             stats.estimated_distinct_count()
         );
-        let dict = prepared.array.as_::<Dict>();
+        let dict = prepared.as_::<Dict>();
         assert_eq!(dict.values().len(), 2);
         assert!(dict.has_all_values_referenced());
         dict.validate_all_values_referenced(&mut ctx)?;
@@ -296,14 +328,15 @@ mod tests {
                 DictArray::try_new(PrimitiveArray::from_option_iter(codes).into_array(), values)?
                     .into_array();
             for input in [dict.clone(), dict.slice(0..dict.len().min(1))?] {
-                let prepared =
-                    prepare_dictionary(&input.as_::<Dict>().into_owned(), opts, &mut ctx)?;
+                let source = input.as_::<Dict>().into_owned();
+                let facts = analyze_dictionary(&source, opts, &mut ctx)?;
+                let prepared = prepare_dictionary(&source, &mut ctx)?;
                 let packed = pack(&input, &mut ctx)?;
-                assert_arrays_eq!(&packed, &prepared.array, &mut ctx);
-                let prepared_dict = prepared.array.as_::<Dict>();
+                assert_arrays_eq!(&packed, &prepared, &mut ctx);
+                let prepared_dict = prepared.as_::<Dict>();
                 assert!(prepared_dict.has_all_values_referenced());
                 prepared_dict.validate_all_values_referenced(&mut ctx)?;
-                assert_eq!(prepared.packed_nbytes, logical_nbytes(&packed, &mut ctx)?);
+                assert_eq!(facts.packed_nbytes, logical_nbytes(&packed, &mut ctx)?);
             }
         }
         Ok(())
@@ -316,7 +349,7 @@ mod tests {
             PrimitiveArray::from_iter([7_u32]).into_array(),
             VarBinViewArray::from_iter_str(["value"]).into_array(),
         )?;
-        let error = prepare_dictionary(&dict, GenerateStatsOptions::default(), &mut ctx)
+        let error = analyze_dictionary(&dict, GenerateStatsOptions::default(), &mut ctx)
             .err()
             .expect("invalid code");
         assert!(error.to_string().contains("out of bounds"));

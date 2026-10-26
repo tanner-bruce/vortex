@@ -17,7 +17,6 @@ use vortex_array::aggregate_fn::fns::is_constant::is_constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::MaskedArray;
-use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
@@ -47,10 +46,14 @@ pub(crate) fn is_constant_for_compression(
     data: &ArrayAndStats,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<bool> {
-    if let Some(dict) = data.array().as_opt::<Dict>() {
-        // Prepared dictionaries contain unique referenced valid values only. Match the
-        // canonical string check, which rejects mixed-null arrays as constant.
-        return Ok(dict.values().len() == 1 && data.varbinview_stats(exec_ctx).null_count() == 0);
+    if data.array().is::<Dict>() {
+        // Source values can contain unused slots and duplicates. Match the canonical
+        // string check, which rejects mixed nulls, and inspect only referenced values.
+        let stats = data.varbinview_stats(exec_ctx);
+        if stats.null_count() != 0 || stats.estimated_distinct_count().is_some_and(|n| n > 1) {
+            return Ok(false);
+        }
+        return is_constant(data.array(), exec_ctx);
     }
     let dtype = data.array().dtype();
 
