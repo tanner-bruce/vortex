@@ -97,7 +97,13 @@ pub fn dict_encode_with_constraints(
 }
 
 pub fn dict_encode(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DictArray> {
-    let dict_array = dict_encode_with_constraints(array, &UNCONSTRAINED, ctx)?;
+    // A one-shot dictionary cannot have more entries (including null) than input rows.
+    // Bound the working code width before encoding, rather than only narrowing afterwards.
+    let constraints = DictConstraints {
+        max_len: array.len(),
+        ..UNCONSTRAINED
+    };
+    let dict_array = dict_encode_with_constraints(array, &constraints, ctx)?;
     if dict_array.len() != array.len() {
         vortex_bail!(
             "must have encoded all {} elements, but only encoded {}",
@@ -107,3 +113,6 @@ pub fn dict_encode(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Dic
     }
     Ok(dict_array)
 }
+
+#[cfg(test)]
+mod tests;
