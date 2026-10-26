@@ -137,6 +137,19 @@ pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
     allowed: AllowedIds,
     mode: CompressionMode,
+    string_dictionary_reuse: bool,
+}
+
+impl Default for BtrBlocksCompressorBuilder {
+    /// Every built-in scheme, unrestricted, as the fork's `ALL_SCHEMES` default was.
+    fn default() -> Self {
+        Self {
+            schemes: crate::CompressionSession::default().schemes().to_vec(),
+            allowed: AllowedIds::all(),
+            mode: CompressionMode::All,
+            string_dictionary_reuse: false,
+        }
+    }
 }
 
 impl BtrBlocksCompressorBuilder {
@@ -148,6 +161,7 @@ impl BtrBlocksCompressorBuilder {
             schemes: session.compression().schemes().to_vec(),
             allowed: AllowedIds::from_session(session),
             mode: CompressionMode::Default,
+            string_dictionary_reuse: false,
         }
     }
 
@@ -160,6 +174,7 @@ impl BtrBlocksCompressorBuilder {
             schemes: Vec::new(),
             allowed: AllowedIds::all(),
             mode: CompressionMode::All,
+            string_dictionary_reuse: false,
         }
     }
 
@@ -225,10 +240,19 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Enables packed Utf8 samples and reuse of existing UInt32 string dictionaries.
+    pub fn with_string_dictionary_reuse(mut self, enabled: bool) -> Self {
+        self.string_dictionary_reuse = enabled;
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`] from the schemes that its preset does not
     /// exclude and whose produced serialized IDs are all allowed.
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.allowed_schemes()))
+        BtrBlocksCompressor(
+            CascadingCompressor::new(self.allowed_schemes())
+                .with_string_dictionary_reuse(self.string_dictionary_reuse),
+        )
     }
 
     fn allowed_schemes(&self) -> Vec<&'static dyn Scheme> {

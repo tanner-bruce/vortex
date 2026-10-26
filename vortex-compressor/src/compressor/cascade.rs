@@ -12,13 +12,16 @@ use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSiz
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Masked;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::UnionArray;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
@@ -29,12 +32,14 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::union::UnionArrayExt;
 use vortex_array::arrays::union::UnionArraySlotsExt;
 use vortex_array::arrays::variant::VariantArraySlotsExt;
+use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
 use super::CascadingCompressor;
 use super::constant;
+use super::strings;
 use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
@@ -77,9 +82,7 @@ impl CascadingCompressor {
         let span = trace::compress_span(array.len(), array.dtype(), before_nbytes);
         let _enter = span.enter();
 
-        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
-        let compact = canonical.compact(exec_ctx)?;
-        let compressed = self.compress_canonical(compact, CompressorContext::new(), exec_ctx)?;
+        let compressed = self.compress_input(array, CompressorContext::new(), exec_ctx)?;
 
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
@@ -108,13 +111,65 @@ impl CascadingCompressor {
             return Ok(child.clone());
         }
 
-        let canonical = child.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
-        let compact = canonical.compact(exec_ctx)?;
-
         let child_ctx = parent_ctx
             .clone()
             .descend_with_scheme(parent_id, child_index);
-        self.compress_canonical(compact, child_ctx, exec_ctx)
+        self.compress_input(child, child_ctx, exec_ctx)
+    }
+
+    /// Preserves supported Utf8 dictionaries before the canonical dispatch.
+    fn compress_input(
+        &self,
+        array: &ArrayRef,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        if self.string_dictionary_reuse
+            && array.dtype().is_utf8()
+            && let Some(dict) = array.as_opt::<Dict>()
+            && dict
+                .codes()
+                .as_opt::<Primitive>()
+                .is_some_and(|codes| codes.ptype() == PType::U32)
+        {
+            let mut eligible = Vec::new();
+            let mut supported = true;
+            for scheme in &self.schemes {
+                if self.is_excluded(*scheme, &compress_ctx) {
+                    continue;
+                }
+                match scheme.matches_string_dictionary() {
+                    Some(true) => eligible.push(*scheme),
+                    Some(false) => {}
+                    None => {
+                        supported = false;
+                        break;
+                    }
+                }
+            }
+            if supported {
+                let opts = eligible
+                    .iter()
+                    .fold(GenerateStatsOptions::default(), |opts, s| {
+                        opts.merge(s.stats_options())
+                    });
+                let prepared = strings::prepare_dictionary(&dict.into_owned(), opts, exec_ctx)?;
+                let data = ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
+                let mut compress_ctx = compress_ctx.with_merged_stats_options(opts);
+                compress_ctx.logical_strings = true;
+                return self
+                    .choose_prepared(
+                        data,
+                        eligible,
+                        prepared.packed_nbytes,
+                        compress_ctx,
+                        exec_ctx,
+                    )
+                    .map(Selection::into_array);
+            }
+        }
+        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
+        self.compress_canonical(canonical.compact(exec_ctx)?, compress_ctx, exec_ctx)
     }
 
     /// Compresses a canonical array by dispatching to type-specific logic.
@@ -276,14 +331,54 @@ impl CascadingCompressor {
             .collect();
 
         let array: ArrayRef = canonical.into();
+        let logical_strings = self.string_dictionary_reuse
+            && array.dtype().is_utf8()
+            && eligible_schemes
+                .iter()
+                .all(|s| s.matches_string_dictionary() == Some(true));
+        // A scheme competes against the bytes the rows reference, not dead bytes in the buffers.
+        // Existing Utf8 dictionaries are measured by their packed logical strings instead.
+        let before_nbytes = if logical_strings {
+            strings::logical_nbytes(&array, exec_ctx)?
+        } else {
+            exact_uncompressed_size(&array, exec_ctx)?
+        };
+        let merged_opts = eligible_schemes
+            .iter()
+            .fold(GenerateStatsOptions::default(), |acc, s| {
+                acc.merge(s.stats_options())
+            });
+        let mut compress_ctx = compress_ctx.with_merged_stats_options(merged_opts);
+        compress_ctx.logical_strings = logical_strings;
+        self.choose_prepared(
+            ArrayAndStats::new(array, merged_opts),
+            eligible_schemes,
+            before_nbytes,
+            compress_ctx,
+            exec_ctx,
+        )
+    }
 
-        if array.is_empty() {
-            return Ok(Selection::Unchanged(array));
+    /// Selects a scheme over canonical data or a prepared logical string dictionary.
+    fn choose_prepared(
+        &self,
+        data: ArrayAndStats,
+        eligible_schemes: Vec<&'static dyn Scheme>,
+        before_nbytes: u64,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Selection> {
+        if data.array().is_empty() {
+            return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         }
 
-        if array.all_invalid(exec_ctx)? {
+        if data.array().all_invalid(exec_ctx)? {
             return Ok(Selection::Compressed(
-                ConstantArray::new(Scalar::null(array.dtype().clone()), array.len()).into_array(),
+                ConstantArray::new(
+                    Scalar::null(data.array().dtype().clone()),
+                    data.array().len(),
+                )
+                .into_array(),
             ));
         }
 
@@ -292,30 +387,35 @@ impl CascadingCompressor {
         // full array is constant.
         //
         // Compare valid values directly so even nullable constants avoid distinct-value counting.
-        if !compress_ctx.is_sample() && constant::is_constant_for_compression(&array, exec_ctx)? {
-            return constant::compress_as_constant(array, exec_ctx).map(Selection::Compressed);
+        let is_constant = if compress_ctx.logical_strings {
+            constant::prepared_dictionary_is_constant(data.array(), exec_ctx)?
+        } else {
+            constant::is_constant_for_compression(data.array(), exec_ctx)?
+        };
+        if !compress_ctx.is_sample() && is_constant {
+            return constant::compress_as_constant(data.array().clone(), exec_ctx)
+                .map(Selection::Compressed);
         }
 
-        // A scheme competes against the bytes the rows reference, not dead bytes in the buffers.
-        let before_nbytes = exact_uncompressed_size(&array, exec_ctx)?;
-
-        let merged_opts = eligible_schemes
-            .iter()
-            .fold(GenerateStatsOptions::default(), |acc, s| {
-                acc.merge(s.stats_options())
-            });
-        let compress_ctx = compress_ctx.with_merged_stats_options(merged_opts);
-
-        let data = ArrayAndStats::new(array, merged_opts);
-
         if eligible_schemes.is_empty() {
-            return Ok(Selection::Unchanged(data.into_array()));
+            return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         }
 
         let Some((winner, winner_estimate)) =
             self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
         else {
-            return Ok(Selection::Unchanged(data.into_array()));
+            return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
+        };
+
+        let packed_full =
+            compress_ctx.logical_strings && winner.id() != crate::builtins::StringDictScheme.id();
+        let data = if packed_full {
+            ArrayAndStats::new(
+                strings::pack(data.array(), exec_ctx)?,
+                compress_ctx.merged_stats_options(),
+            )
+        } else {
+            data
         };
 
         // Run the winning scheme's `compress`. On failure, emit an ERROR event carrying the
@@ -323,7 +423,7 @@ impl CascadingCompressor {
         let error_ctx = trace::enabled_error_context(&compress_ctx);
         let _winner_span = trace::winner_compress_span(winner.id(), before_nbytes).entered();
         let compressed = winner
-            .compress(self, &data, compress_ctx, exec_ctx)
+            .compress(self, &data, compress_ctx.clone(), exec_ctx)
             .inspect_err(|err| {
                 // NB: this is the only way we can tell which scheme panicked / bailed on their
                 // data, especially for third-party schemes where the error site may not carry any
@@ -345,6 +445,22 @@ impl CascadingCompressor {
 
         if accepted {
             Ok(Selection::Compressed(compressed))
+        } else if packed_full {
+            Ok(Selection::Unchanged(data.into_array()))
+        } else {
+            self.finish_uncompressed(data, &compress_ctx, exec_ctx)
+        }
+    }
+
+    /// Returns the canonical fallback, packing logical strings only when needed.
+    fn finish_uncompressed(
+        &self,
+        data: ArrayAndStats,
+        ctx: &CompressorContext,
+        exec: &mut ExecutionCtx,
+    ) -> VortexResult<Selection> {
+        if ctx.logical_strings {
+            Ok(Selection::Unchanged(strings::pack(data.array(), exec)?))
         } else {
             Ok(Selection::Unchanged(data.into_array()))
         }

@@ -18,7 +18,9 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::aggregate_fn::fns::is_constant::is_constant;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::MaskedArray;
+use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
@@ -37,6 +39,25 @@ use crate::trace;
 const CONSTANT_SCHEME_ID: SchemeId = SchemeId {
     name: "vortex.compressor.constant",
 };
+
+/// Whether a prepared string dictionary is constant.
+///
+/// Prepared dictionaries contain unique referenced valid values only. Match the canonical string
+/// check, which rejects mixed-null arrays as constant.
+pub(crate) fn prepared_dictionary_is_constant(
+    array: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<bool> {
+    let Some(dict) = array.as_opt::<Dict>() else {
+        return Ok(false);
+    };
+    if dict.values().len() != 1 {
+        return Ok(false);
+    }
+    let codes = dict.codes().validity()?.execute_mask(dict.len(), ctx)?;
+    let values = dict.values().validity()?.execute_mask(1, ctx)?;
+    Ok(codes.all_true() && values.all_true())
+}
 
 /// Checks for equal valid values without generating compression statistics.
 ///

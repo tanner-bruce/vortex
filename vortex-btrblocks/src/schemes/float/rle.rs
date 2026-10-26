@@ -38,6 +38,10 @@ impl Scheme for FloatRLEScheme {
         canonical.dtype().is_float()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         vec![RLE.id()]
     }

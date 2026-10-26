@@ -48,6 +48,10 @@ impl Scheme for StringDictScheme {
         canonical.dtype().is_utf8()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         vec![Dict.id()]
     }
@@ -107,7 +111,11 @@ impl Scheme for StringDictScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let dict = dict_encode(data.array(), exec_ctx)?;
+        let dict = if let Some(dict) = data.array().as_opt::<Dict>() {
+            dict.into_owned()
+        } else {
+            dict_encode(data.array(), exec_ctx)?
+        };
 
         // Values = child 0.
         let compressed_values =
