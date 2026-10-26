@@ -156,20 +156,26 @@ pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
     compress_ctx: CompressorContext,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<EstimateScore> {
-    let sample_array = if compress_ctx.is_sample() {
+    let sample_array = if compress_ctx.logical_strings && array.dtype().is_utf8() {
+        let ranges = if compress_ctx.is_sample() {
+            vec![(0, array.len())]
+        } else {
+            stratified_slices(
+                array.len(),
+                SAMPLE_SIZE,
+                sample_count_approx_one_percent(array.len()),
+                &mut StdRng::seed_from_u64(SAMPLE_SEED),
+            )
+        };
+        super::strings::pack_ranges(array, &ranges, exec_ctx)?
+    } else if compress_ctx.is_sample() {
         array.clone()
     } else {
         let sample_count = sample_count_approx_one_percent(array.len());
-        // `ArrayAndStats` expects a canonical array (so that it can easily compute lazy stats).
         let canonical: Canonical = sample(array, SAMPLE_SIZE, sample_count).execute(exec_ctx)?;
         canonical.into_array()
     };
 
-    let sample_array = if compress_ctx.logical_strings && sample_array.dtype().is_utf8() {
-        super::strings::pack(&sample_array, exec_ctx)?
-    } else {
-        sample_array
-    };
     let sample_data = ArrayAndStats::new(sample_array, scheme.stats_options());
     let error_ctx = trace::enabled_error_context(&compress_ctx);
     let sample_ctx = compress_ctx.with_sampling();
@@ -199,7 +205,9 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_array::arrays::DictArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
@@ -221,6 +229,42 @@ mod tests {
             let again = sample(&array, SAMPLE_SIZE, SAMPLE_COUNT);
             assert_eq!(first.nbytes(), again.nbytes());
             assert_arrays_eq!(&first, &again, &mut ctx);
+        }
+        Ok(())
+    }
+    #[test]
+    fn packed_dictionary_samples_preserve_positions_nulls_and_bytes() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let values = VarBinViewArray::from_iter_nullable_str([
+            Some("unused value"),
+            Some("first outlined repeated value"),
+            None,
+            Some(""),
+            Some("first outlined repeated value"),
+            Some("another outlined repeated value"),
+        ])
+        .into_array();
+        let codes = PrimitiveArray::from_option_iter((0..8192).map(|i| {
+            if i % 17 == 0 {
+                None
+            } else {
+                Some(1 + (i % 5) as u32)
+            }
+        }))
+        .into_array();
+        let dict = DictArray::try_new(codes, values)?.into_array();
+        for input in [dict.clone(), dict.slice(32..4096)?] {
+            let ranges = stratified_slices(
+                input.len(),
+                SAMPLE_SIZE,
+                SAMPLE_COUNT,
+                &mut StdRng::seed_from_u64(SAMPLE_SEED),
+            );
+            let actual = super::super::strings::pack_ranges(&input, &ranges, &mut ctx)?;
+            let sampled: Canonical = sample(&input, SAMPLE_SIZE, SAMPLE_COUNT).execute(&mut ctx)?;
+            let expected = super::super::strings::pack(&sampled.into_array(), &mut ctx)?;
+            assert_arrays_eq!(&expected, &actual, &mut ctx);
+            assert_eq!(expected.nbytes(), actual.nbytes());
         }
         Ok(())
     }

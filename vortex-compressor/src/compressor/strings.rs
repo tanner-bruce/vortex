@@ -193,7 +193,23 @@ pub(super) fn prepare_dictionary(
 
 /// Packs selected logical strings, dropping unrelated buffers and invalid view payloads.
 pub(super) fn pack(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    pack_ranges(array, &[(0, array.len())], ctx)
+}
+
+/// Packs logical sample rows directly, avoiding intermediate sliced dictionary arrays.
+pub(super) fn pack_ranges(
+    array: &ArrayRef,
+    ranges: &[(usize, usize)],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
     let _phase = tracing::debug_span!("dictionary_pack").entered();
+    let len = ranges.iter().try_fold(0_usize, |len, &(start, end)| {
+        if start > end || end > array.len() {
+            return Err(vortex_err!("String sample range is out of bounds"));
+        }
+        len.checked_add(end - start)
+            .ok_or_else(|| vortex_err!("String sample size overflow"))
+    })?;
     if let Some(dict) = array.as_opt::<Dict>() {
         let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
         let values = dict.values().clone().execute::<VarBinViewArray>(ctx)?;
@@ -201,24 +217,27 @@ pub(super) fn pack(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Arr
         let value_mask = values.validity()?.execute_mask(values.len(), ctx)?;
         let mut builder = VarBinViewBuilder::with_capacity_in(
             array.dtype().clone(),
-            array.len(),
+            len,
             BufferAllocatorRef::statically_allocated(),
         );
-        for (&code, valid) in codes.as_slice::<u32>().iter().zip(code_mask.iter()) {
-            if !valid {
-                builder.append_null();
-                continue;
-            }
-            let slot = code as usize;
-            if slot >= values.len() {
-                return Err(vortex_err!(
-                    "String dictionary code {code} is out of bounds"
-                ));
-            }
-            if value_mask.value(slot) {
-                builder.append_value(value_bytes(&values, slot));
-            } else {
-                builder.append_null();
+        for &(start, end) in ranges {
+            let mask = code_mask.slice(start..end);
+            for (&code, valid) in codes.as_slice::<u32>()[start..end].iter().zip(mask.iter()) {
+                if !valid {
+                    builder.append_null();
+                    continue;
+                }
+                let slot = code as usize;
+                if slot >= values.len() {
+                    return Err(vortex_err!(
+                        "String dictionary code {code} is out of bounds"
+                    ));
+                }
+                if value_mask.value(slot) {
+                    builder.append_value(value_bytes(&values, slot));
+                } else {
+                    builder.append_null();
+                }
             }
         }
         return Ok(builder.finish_into_varbinview().into_array());
@@ -227,14 +246,17 @@ pub(super) fn pack(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Arr
     let mask = values.validity()?.execute_mask(values.len(), ctx)?;
     let mut builder = VarBinViewBuilder::with_capacity_in(
         values.dtype().clone(),
-        values.len(),
+        len,
         BufferAllocatorRef::statically_allocated(),
     );
-    for (slot, valid) in mask.iter().enumerate() {
-        if valid {
-            builder.append_value(value_bytes(&values, slot));
-        } else {
-            builder.append_null();
+    for &(start, end) in ranges {
+        let selected = mask.slice(start..end);
+        for (slot, valid) in (start..end).zip(selected.iter()) {
+            if valid {
+                builder.append_value(value_bytes(&values, slot));
+            } else {
+                builder.append_null();
+            }
         }
     }
     Ok(builder.finish_into_varbinview().into_array())

@@ -339,7 +339,12 @@ impl CascadingCompressor {
         if data.array().is_empty() {
             return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         }
-        if data.array().all_invalid(exec_ctx)? {
+        let all_invalid = if data.array().is::<Dict>() {
+            data.varbinview_stats(exec_ctx).null_count() as usize == data.array_len()
+        } else {
+            data.array().all_invalid(exec_ctx)?
+        };
+        if all_invalid {
             return Ok(ConstantArray::new(
                 Scalar::null(data.array().dtype().clone()),
                 data.array().len(),
