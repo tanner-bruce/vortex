@@ -20,7 +20,6 @@ use vortex_array::aggregate_fn::fns::is_constant::is_constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::MaskedArray;
-use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::extension::ExtensionArrayExt;
@@ -33,6 +32,7 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
 use crate::scheme::SchemeId;
+use crate::stats::ArrayAndStats;
 use crate::trace;
 
 /// Synthetic scheme ID reported in traces when the compressor's built-in constant encoding wins.
@@ -40,23 +40,22 @@ const CONSTANT_SCHEME_ID: SchemeId = SchemeId {
     name: "vortex.compressor.constant",
 };
 
-/// Whether a prepared string dictionary is constant.
+/// Whether a string dictionary array is constant.
 ///
-/// Prepared dictionaries contain unique referenced valid values only. Match the canonical string
-/// check, which rejects mixed-null arrays as constant.
-pub(crate) fn prepared_dictionary_is_constant(
-    array: &ArrayRef,
+/// Source values can contain unused slots and duplicates. Match the canonical string check,
+/// which rejects mixed nulls, and inspect only referenced values.
+pub(crate) fn dictionary_is_constant(
+    data: &ArrayAndStats,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<bool> {
-    let Some(dict) = array.as_opt::<Dict>() else {
-        return Ok(false);
-    };
-    if dict.values().len() != 1 {
+    if !data.array().is::<Dict>() {
         return Ok(false);
     }
-    let codes = dict.codes().validity()?.execute_mask(dict.len(), ctx)?;
-    let values = dict.values().validity()?.execute_mask(1, ctx)?;
-    Ok(codes.all_true() && values.all_true())
+    let stats = data.varbinview_stats(ctx);
+    if stats.null_count() != 0 || stats.estimated_distinct_count().is_some_and(|n| n > 1) {
+        return Ok(false);
+    }
+    is_constant(data.array(), ctx)
 }
 
 /// Checks for equal valid values without generating compression statistics.
