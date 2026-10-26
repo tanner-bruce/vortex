@@ -68,6 +68,7 @@ pub(super) fn prepare_dictionary(
     opts: GenerateStatsOptions,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PreparedDictionary> {
+    let _phase = tracing::debug_span!("dictionary_prepare").entered();
     let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
     let values = dict.values().clone().execute::<VarBinViewArray>(ctx)?;
     let code_mask = codes.validity()?.execute_mask(codes.len(), ctx)?;
@@ -161,6 +162,7 @@ pub(super) fn prepare_dictionary(
 
 /// Packs selected logical strings, dropping unrelated buffers and invalid view payloads.
 pub(super) fn pack(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    let _phase = tracing::debug_span!("dictionary_pack").entered();
     if let Some(dict) = array.as_opt::<Dict>() {
         let codes = dict.codes().clone().execute::<PrimitiveArray>(ctx)?;
         let values = dict.values().clone().execute::<VarBinViewArray>(ctx)?;
