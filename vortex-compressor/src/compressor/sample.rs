@@ -156,7 +156,17 @@ pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
     compress_ctx: CompressorContext,
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<EstimateScore> {
-    let sample_array = if compress_ctx.logical_strings && array.dtype().is_utf8() {
+    let sample_array = prepare_sample(array, &compress_ctx, exec_ctx)?;
+    estimate_compression_ratio_from_sample(compressor, scheme, sample_array, compress_ctx, exec_ctx)
+}
+
+/// Builds the deterministic sample without scheme-specific statistics.
+pub(super) fn prepare_sample(
+    array: &ArrayRef,
+    compress_ctx: &CompressorContext,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    Ok(if compress_ctx.logical_strings && array.dtype().is_utf8() {
         let ranges = if compress_ctx.is_sample() {
             vec![(0, array.len())]
         } else {
@@ -174,8 +184,17 @@ pub(super) fn estimate_compression_ratio_with_sampling<S: Scheme + ?Sized>(
         let sample_count = sample_count_approx_one_percent(array.len());
         let canonical: Canonical = sample(array, SAMPLE_SIZE, sample_count).execute(exec_ctx)?;
         canonical.into_array()
-    };
+    })
+}
 
+/// Scores one scheme with fresh statistics over an already prepared sample.
+pub(super) fn estimate_compression_ratio_from_sample<S: Scheme + ?Sized>(
+    compressor: &CascadingCompressor,
+    scheme: &S,
+    sample_array: ArrayRef,
+    compress_ctx: CompressorContext,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<EstimateScore> {
     let sample_data = ArrayAndStats::new(sample_array, scheme.stats_options());
     let error_ctx = trace::enabled_error_context(&compress_ctx);
     let sample_ctx = compress_ctx.with_sampling();

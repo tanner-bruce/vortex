@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -950,5 +951,87 @@ fn dictionary_reuse_detects_constants_from_referenced_values() -> VortexResult<(
         assert_eq!(output.is::<Constant>(), constant);
         assert_arrays_eq!(&source, &output, &mut ctx);
     }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InspectStringSample {
+    name: &'static str,
+    count_distinct_values: bool,
+    samples: Arc<Mutex<Vec<ArrayRef>>>,
+}
+
+impl Scheme for InspectStringSample {
+    fn scheme_name(&self) -> &'static str {
+        self.name
+    }
+    fn matches(&self, canonical: &Canonical) -> bool {
+        canonical.dtype().is_utf8()
+    }
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+    fn stats_options(&self) -> GenerateStatsOptions {
+        GenerateStatsOptions {
+            count_distinct_values: self.count_distinct_values,
+        }
+    }
+    fn expected_compression_ratio(
+        &self,
+        _: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        CompressionEstimate::Deferred(DeferredEstimate::Sample)
+    }
+    fn compress(
+        &self,
+        _: &CascadingCompressor,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        assert_eq!(
+            data.varbinview_stats(ctx)
+                .estimated_distinct_count()
+                .is_some(),
+            self.count_distinct_values
+        );
+        self.samples.lock().push(data.array().clone());
+        Ok(PrimitiveArray::from_iter(std::iter::repeat_n(0_u8, data.array_len())).into_array())
+    }
+}
+
+#[test]
+fn logical_strings_share_only_sample_storage_between_scheme_trials() -> VortexResult<()> {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let first = Box::leak(Box::new(InspectStringSample {
+        name: "test.sample_first",
+        count_distinct_values: false,
+        samples: Arc::clone(&samples),
+    }));
+    let second = Box::leak(Box::new(InspectStringSample {
+        name: "test.sample_second",
+        count_distinct_values: true,
+        samples: Arc::clone(&samples),
+    }));
+    let schemes: [&'static dyn Scheme; 2] = [first, second];
+    let compressor = CascadingCompressor::new(schemes.to_vec());
+    let input = VarBinViewArray::from_iter_str((0..4096).map(|_| "a repeated outlined string"))
+        .into_array();
+    let data = ArrayAndStats::new(input, GenerateStatsOptions::default());
+    let mut ctx = SESSION.create_execution_ctx();
+    for _ in 0..2 {
+        let mut compress_ctx = CompressorContext::new();
+        compress_ctx.logical_strings = true;
+        let winner = compressor.choose_best_scheme(&schemes, &data, compress_ctx, &mut ctx)?;
+        assert_eq!(winner.expect("sample winner").0.id(), first.id());
+    }
+    let samples = samples.lock();
+    assert_eq!(samples.len(), 4);
+    assert_eq!(samples[0].len(), 1024);
+    assert!(ArrayRef::ptr_eq(&samples[0], &samples[1]));
+    assert!(ArrayRef::ptr_eq(&samples[2], &samples[3]));
+    assert!(!ArrayRef::ptr_eq(&samples[0], &samples[2]));
     Ok(())
 }
