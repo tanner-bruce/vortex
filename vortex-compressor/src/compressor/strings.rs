@@ -112,6 +112,36 @@ impl StringValues {
             Self::Views(values) => value_bytes(values, slot),
         }
     }
+
+    /// Reads lengths without touching outlined string payloads.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "validated offsets are positions within an existing host byte buffer, so fit usize"
+    )]
+    fn len(&self, slot: usize) -> usize {
+        match self {
+            Self::Offsets32 { offsets, .. } => (offsets[slot + 1] - offsets[slot]) as usize,
+            Self::Offsets64 { offsets, .. } => (offsets[slot + 1] - offsets[slot]) as usize,
+            Self::Views(values) => values.views()[slot].len() as usize,
+        }
+    }
+
+    /// Preserves raw view prefixes; offset strings derive their canonical prefix.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the existing string estimator uses the low eight bytes of a view"
+    )]
+    fn prefix(&self, slot: usize) -> VortexResult<u64> {
+        if let Self::Views(values) = self {
+            return Ok(values.views()[slot].as_u128() as u64);
+        }
+        let bytes = self.value(slot);
+        let mut prefix = [0_u8; 8];
+        prefix[..4].copy_from_slice(&u32::try_from(bytes.len())?.to_le_bytes());
+        let prefix_len = bytes.len().min(4);
+        prefix[4..4 + prefix_len].copy_from_slice(&bytes[..prefix_len]);
+        Ok(u64::from_le_bytes(prefix))
+    }
 }
 
 /// Reads canonical view bytes without an allocating scalar accessor.
@@ -181,21 +211,15 @@ pub(super) fn analyze_dictionary(
             null_count += 1;
             continue;
         }
-        let bytes = values.value(slot);
-        if bytes.len() > 12 {
+        let len = values.len(slot);
+        if len > 12 {
             outlined = outlined
-                .checked_add(u64::try_from(bytes.len())?)
+                .checked_add(u64::try_from(len)?)
                 .ok_or_else(|| vortex_err!("Packed string byte size overflow"))?;
         }
         if opts.count_distinct_values && !seen[slot] {
             seen[slot] = true;
-            // Canonical view estimator: little-endian length then up to four bytes,
-            // zero padded for inline strings shorter than four bytes.
-            let mut prefix = [0_u8; 8];
-            prefix[..4].copy_from_slice(&u32::try_from(bytes.len())?.to_le_bytes());
-            let prefix_len = bytes.len().min(4);
-            prefix[4..4 + prefix_len].copy_from_slice(&bytes[..prefix_len]);
-            prefixes.insert(u64::from_le_bytes(prefix));
+            prefixes.insert(values.prefix(slot)?);
         }
     }
     if opts.count_distinct_values && null_count > 0 {
@@ -370,10 +394,45 @@ mod tests {
     use vortex_array::arrays::VarBinView;
     use vortex_array::arrays::dict::DictArrayExt;
     use vortex_array::arrays::varbin::builder::VarBinBuilder;
+    use vortex_array::arrays::varbinview::BinaryView;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::OffsetBuilderPType;
 
     use super::*;
+
+    #[test]
+    fn preserves_existing_view_prefixes_in_dictionary_analysis() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        // Safe view construction accepts unused inline padding. Preserve the
+        // existing estimator's raw prefixes even when the logical values agree.
+        let views = (1_u128..=4)
+            .map(|tag| BinaryView::from(1 | (0x61 << 32) | (tag << 40)))
+            .collect::<Buffer<_>>();
+        let values = VarBinViewArray::try_new(
+            views,
+            Default::default(),
+            DType::Utf8(Nullability::NonNullable),
+            Validity::NonNullable,
+            &mut ctx,
+        )?;
+        let opts = GenerateStatsOptions {
+            count_distinct_values: true,
+        };
+        let expected = StringStats::generate_opts(&values, opts, &mut ctx);
+        let dict = DictArray::try_new(
+            PrimitiveArray::from_iter(0_u32..4).into_array(),
+            values.into_array(),
+        )?;
+        let actual = analyze_dictionary(&dict, opts, &mut ctx)?;
+        assert_eq!(expected.estimated_distinct_count(), Some(4));
+        assert_eq!(
+            actual.stats.estimated_distinct_count(),
+            expected.estimated_distinct_count()
+        );
+        assert_eq!(actual.stats.value_count(), expected.value_count());
+        assert_eq!(actual.stats.null_count(), expected.null_count());
+        Ok(())
+    }
 
     #[test]
     fn prepares_only_referenced_unique_values_and_effective_nulls() -> VortexResult<()> {
