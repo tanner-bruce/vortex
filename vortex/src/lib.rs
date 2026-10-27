@@ -160,6 +160,8 @@ pub mod compressor {
     pub use vortex_btrblocks::CompressionSessionExt;
     pub use vortex_btrblocks::Scheme;
     pub use vortex_btrblocks::SchemeId;
+    pub use vortex_btrblocks::StringDictionaryCapacity;
+    pub use vortex_btrblocks::StringDictionaryMemoryShape;
 }
 
 /// Vortex editions: versioned sets of serialized components.
