@@ -7,8 +7,12 @@ mod cascade;
 mod constant;
 mod sample;
 mod select;
+mod string_capacity;
 mod strings;
 mod structural;
+
+pub use string_capacity::StringDictionaryCapacity;
+pub use string_capacity::StringDictionaryMemoryShape;
 
 use crate::builtins::IntDictScheme;
 use crate::scheme::ChildSelection;
