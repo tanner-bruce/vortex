@@ -27,6 +27,7 @@ use vortex::array::expr::stats::Stat;
 use vortex::array::expr::stats::StatsProvider;
 use vortex::array::serde::SerializeOptions;
 use vortex::array::serde::SerializedArray;
+use vortex::array::serde::array_flatbuffer;
 use vortex::array::stats::StatsSetRef;
 use vortex::buffer::BufferString;
 use vortex::buffer::ByteBuffer;
@@ -483,20 +484,23 @@ impl LayoutStrategy for CudaFlatLayoutStrategy {
         // Scan for constant array buffers before serialization (while data is still on host).
         let host_buffers = extract_constant_buffers(&chunk);
 
-        let buffers = chunk.serialize(
+        let mut segment = segment_sink.new_segment();
+        chunk.serialize_into(
             ctx.array_ctx(),
             session,
             &SerializeOptions {
                 offset: 0,
                 include_padding: options.include_padding,
             },
+            &mut segment,
         )?;
-        assert!(buffers.len() >= 2);
 
         // Always store the array tree inline (the cuda path requires it for planning).
-        let array_tree = buffers[buffers.len() - 2].clone();
+        let array_tree = ByteBuffer::copy_from(
+            array_flatbuffer(&segment).vortex_expect("a serialized array has a flatbuffer"),
+        );
 
-        let segment_id = segment_sink.write(sequence_id, buffers).await?;
+        let segment_id = segment_sink.write(sequence_id, segment).await?;
 
         let None = stream.next().await else {
             vortex_bail!("CudaFlatLayoutStrategy received stream with more than a single chunk");

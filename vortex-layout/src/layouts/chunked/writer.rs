@@ -10,7 +10,6 @@ use futures::TryStreamExt;
 use futures::stream;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
 use crate::LayoutRef;
@@ -51,9 +50,9 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
         let dtype = stream.dtype().clone();
         let dtype2 = dtype.clone();
         let chunk_strategy = Arc::clone(&self.chunk_strategy);
-        let handle = session.handle();
 
-        // We spawn each child to allow parallelism when processing chunks.
+        // Each child is a future polled concurrently with the others on this task. Their
+        // compression runs on the CPU pool, so chunks still compress in parallel.
         let stream = stream! {
             let mut stream = stream;
             while let Some(chunk) = stream.next().await {
@@ -63,9 +62,8 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
                 let ctx = ctx.clone();
                 let segment_sink = Arc::clone(&segment_sink);
                 let dtype = dtype2.clone();
-                let session = session.clone();
 
-                yield handle.spawn_nested(move |_| async move {
+                yield async move {
                     chunk_strategy
                         .write_stream(
                             ctx,
@@ -76,10 +74,10 @@ impl LayoutStrategy for ChunkedLayoutStrategy {
                             )
                             .sendable(),
                             chunk_eof,
-                            &session,
+                            session,
                         )
                         .await
-                })
+                }
             }
         };
 

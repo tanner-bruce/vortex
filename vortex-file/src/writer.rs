@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::future::poll_fn;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use futures::TryStreamExt;
 use futures::future::Fuse;
 use futures::future::LocalBoxFuture;
 use futures::future::ready;
+use futures::future::try_join;
 use futures::pin_mut;
 use futures::select;
 use itertools::Itertools;
@@ -44,9 +46,11 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_io::IoBuf;
+use vortex_io::Segment;
+use vortex_io::SegmentWrite;
 use vortex_io::VortexWrite;
 use vortex_io::runtime::BlockingRuntime;
-use vortex_io::session::RuntimeSessionExt;
+use vortex_io::write_segment_to;
 use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
 use vortex_layout::LayoutStrategy;
@@ -264,13 +268,28 @@ impl VortexWriteOptions {
         write: W,
         stream: S,
     ) -> VortexResult<WriteSummary> {
-        self.write_internal(write, ArrayStreamExt::boxed(stream))
+        self.write_internal(WriteOutput(write), ArrayStreamExt::boxed(stream))
             .await
     }
 
-    async fn write_internal<W: VortexWrite + Unpin>(
+    /// Write an [`ArrayStream`] as a Vortex file into a sink that takes whole segments.
+    ///
+    /// The file magic, each data segment and the footer arrive in their own
+    /// [`SegmentWrite::write_segment`], in file order, and the bytes are those [`Self::write`]
+    /// produces. The writer waits on [`SegmentWrite::poll_credit`] before each segment, and
+    /// reuses the segments the sink hands back.
+    pub async fn write_segments<W: SegmentWrite + Send + Unpin, S: ArrayStream + Send + 'static>(
         self,
-        mut write: W,
+        sink: W,
+        stream: S,
+    ) -> VortexResult<WriteSummary> {
+        self.write_internal(SegmentWriteOutput(sink), ArrayStreamExt::boxed(stream))
+            .await
+    }
+
+    async fn write_internal<O: SegmentOutput>(
+        self,
+        mut output: O,
         stream: SendableArrayStream,
     ) -> VortexResult<WriteSummary> {
         validate_metadata_segments(&self.metadata)?;
@@ -339,42 +358,51 @@ impl VortexWriteOptions {
         )?;
 
         // First, write the magic bytes.
-        write.write_all(ByteBuffer::copy_from(MAGIC_BYTES)).await?;
+        let mut magic = Segment::new();
+        magic.push_framing_bytes(&MAGIC_BYTES);
+        output.write(magic).await?;
         let mut position = MAGIC_BYTES.len() as u64;
 
-        // Create a channel to send buffers from the segment sink to the output stream.
-        let (send, recv_stream) = bounded(1);
+        // Create a rendezvous channel to send segments from the segment sink to the output
+        // stream. It holds no segment of its own: while the output writes one segment, the sink
+        // holds at most the next, so a stalled output retains no more input than when the channel
+        // carried buffers.
+        let (send, recv_stream) = futures::channel::mpsc::channel(0);
 
         let segments = Arc::new(BufferedSegmentSink::new(send, position));
+        let recycle = segments.recycler();
 
-        // We spawn the layout future so it is driven in the background while we write the
-        // buffer stream, so we don't need to poll it until all buffers have been drained.
+        // The layout future is joined with the drain below, so the whole write is one future that
+        // runs on the caller's task. The layout future owns the sink, and with it the channel's
+        // sender, so the drain ends when the layout is written.
         let ctx2 = ctx.clone();
-        let session = self.session.clone();
-        let layout_fut = self.session.handle().spawn_nested(move |_| async move {
+        let session = &self.session;
+        let layout_fut = async move {
             let layout = strategy
                 .write_stream(
                     ctx2,
                     Arc::<BufferedSegmentSink>::clone(&segments),
                     stream,
                     eof,
-                    &session,
+                    session,
                 )
                 .await?;
             Ok::<_, VortexError>((layout, segments.segment_specs()))
-        });
+        };
 
-        // Flush buffers as they arrive
-        pin_mut!(recv_stream);
-        while let Some(buffer) = recv_stream.next().await {
-            if buffer.is_empty() {
-                continue;
+        // Flush segments as they arrive, and keep the ones the output hands back for reuse.
+        let drain_fut = async {
+            pin_mut!(recv_stream);
+            while let Some(segment) = recv_stream.next().await {
+                position += segment.padded_len();
+                if let Some(returned) = output.write(segment).await? {
+                    recycle.recycle(returned);
+                }
             }
-            position += buffer.len() as u64;
-            write.write_all(buffer).await?;
-        }
+            Ok::<_, VortexError>(())
+        };
 
-        let (layout, segment_specs) = layout_fut.await?;
+        let ((layout, segment_specs), ()) = try_join(layout_fut, drain_fut).await?;
 
         // Assemble the Footer object now that we have all the segments.
         let statistics = if omit_statistics {
@@ -399,7 +427,7 @@ impl VortexWriteOptions {
         );
 
         // Emit the footer buffers and EOF.
-        let (footer_buffers, metadata, approx_byte_size) = footer
+        let (footer_segment, metadata, approx_byte_size) = footer
             .clone()
             .into_serializer(&self.session)
             .with_layout_context(new_layout_context(&self.session, enforce_editions))
@@ -411,12 +439,10 @@ impl VortexWriteOptions {
             .with_metadata_segments(metadata)
             .with_approx_byte_size(approx_byte_size);
 
-        for buffer in footer_buffers {
-            position += buffer.len() as u64;
-            write.write_all(buffer).await?;
-        }
+        position += footer_segment.padded_len();
+        output.write(footer_segment).await?;
 
-        write.flush().await?;
+        output.flush().await?;
 
         Ok(WriteSummary {
             footer,
@@ -768,6 +794,50 @@ impl<W: Write + Unpin + Send> VortexWrite for BlockingWriteAdapter<W> {
 
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> + Send {
         ready(Ok(()))
+    }
+}
+
+/// Where [`VortexWriteOptions::write_internal`] sends the file, one segment at a time.
+///
+/// The futures are `Send`, so the whole write stays `Send` for callers that spawn it.
+trait SegmentOutput: Send {
+    /// Write one segment, returning it if the output is done with it.
+    fn write(
+        &mut self,
+        segment: Segment,
+    ) -> impl Future<Output = io::Result<Option<Segment>>> + Send;
+
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+/// Writes each segment's pieces with [`VortexWrite::write_all`].
+struct WriteOutput<W>(W);
+
+impl<W: VortexWrite + Unpin> SegmentOutput for WriteOutput<W> {
+    fn write(
+        &mut self,
+        segment: Segment,
+    ) -> impl Future<Output = io::Result<Option<Segment>>> + Send {
+        write_segment_to(&mut self.0, segment).map(|result| result.map(Some))
+    }
+
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.flush()
+    }
+}
+
+/// Hands each segment to a [`SegmentWrite`] once it has credit.
+struct SegmentWriteOutput<W>(W);
+
+impl<W: SegmentWrite + Send + Unpin> SegmentOutput for SegmentWriteOutput<W> {
+    async fn write(&mut self, segment: Segment) -> io::Result<Option<Segment>> {
+        poll_fn(|cx| self.0.poll_credit(cx)).await?;
+        self.0.write_segment(segment)?;
+        Ok(self.0.take_returned())
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        poll_fn(|cx| self.0.poll_flush(cx)).await
     }
 }
 
