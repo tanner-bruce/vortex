@@ -12,6 +12,7 @@ use vortex_array::scalar::ScalarTruncation;
 use vortex_array::scalar::lower_bound;
 use vortex_array::scalar::upper_bound;
 use vortex_array::serde::SerializeOptions;
+use vortex_array::serde::array_flatbuffer;
 use vortex_array::stats::StatsSetRef;
 use vortex_buffer::BufferString;
 use vortex_buffer::ByteBuffer;
@@ -142,19 +143,25 @@ impl LayoutStrategy for FlatLayoutStrategy {
             _ => {}
         }
 
-        let buffers = chunk.serialize(
+        let mut segment = segment_sink.new_segment();
+        chunk.serialize_into(
             ctx.array_ctx(),
             session,
             &SerializeOptions {
                 offset: 0,
                 include_padding: self.include_padding,
             },
+            &mut segment,
         )?;
-        // there is at least the flatbuffer and the length
-        assert!(buffers.len() >= 2);
-        let array_node =
-            flat_layout_inline_array_node().then(|| buffers[buffers.len() - 2].clone());
-        let segment_id = segment_sink.write(sequence_id, buffers).await?;
+        let array_node = flat_layout_inline_array_node().then(|| {
+            ByteBuffer::copy_from(
+                array_flatbuffer(&segment).vortex_expect("a serialized array has a flatbuffer"),
+            )
+        });
+        // The segment holds the chunk's buffers now, so the sink's release frees them unless
+        // an input array still shares them.
+        drop(chunk);
+        let segment_id = segment_sink.write(sequence_id, segment).await?;
 
         let None = stream.next().await else {
             vortex_bail!("flat layout received stream with more than a single chunk");

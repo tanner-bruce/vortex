@@ -515,9 +515,9 @@ mod tests {
         insta::assert_snapshot!(layout.display_tree(), @"
         vortex.list, dtype: list({a=i32, b=i32}), children: 2
         ├── elements: vortex.struct, dtype: {a=i32, b=i32}, children: 2
-        │   ├── a: vortex.flat, dtype: i32, segment: 1
-        │   └── b: vortex.flat, dtype: i32, segment: 2
-        └── offsets: vortex.flat, dtype: u64, segment: 0
+        │   ├── a: vortex.flat, dtype: i32, segment: 0
+        │   └── b: vortex.flat, dtype: i32, segment: 1
+        └── offsets: vortex.flat, dtype: u64, segment: 2
         ");
         Ok(())
     }

@@ -5,11 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use async_channel::Sender;
 use async_trait::async_trait;
+use futures::SinkExt;
 use parking_lot::Mutex;
-use vortex_buffer::Alignment;
-use vortex_buffer::ByteBuffer;
+use vortex_buffer::segment::Segment;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_layout::segments::SegmentId;
@@ -18,18 +17,47 @@ use vortex_layout::sequence::SequenceId;
 
 use crate::footer::SegmentSpec;
 
+/// Segments kept for reuse. A file writer has at most a few segments in flight, so a handful
+/// covers steady state without holding much memory.
+const MAX_RECYCLED_SEGMENTS: usize = 8;
+
 pub struct BufferedSegmentSink {
-    buffers: Sender<ByteBuffer>,
+    segments: futures::channel::mpsc::Sender<Segment>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
+    recycled: SegmentRecycler,
+}
+
+/// Segments the output is done with, kept for the sink to hand out again.
+///
+/// It is separate from [`BufferedSegmentSink`] because the sink owns the channel's sender: the
+/// output side must not keep the sink alive, or the channel never closes.
+#[derive(Clone, Default)]
+pub struct SegmentRecycler(Arc<Mutex<Vec<Segment>>>);
+
+impl SegmentRecycler {
+    /// Keep a segment the output is done with, so a later [`SegmentSink::new_segment`] reuses
+    /// its storage.
+    pub fn recycle(&self, mut segment: Segment) {
+        let mut recycled = self.0.lock();
+        if recycled.len() < MAX_RECYCLED_SEGMENTS {
+            segment.clear();
+            recycled.push(segment);
+        }
+    }
+
+    fn take(&self) -> Segment {
+        self.0.lock().pop().unwrap_or_default()
+    }
 }
 
 impl BufferedSegmentSink {
-    pub fn new(send: Sender<ByteBuffer>, byte_offset: u64) -> Self {
+    pub fn new(send: futures::channel::mpsc::Sender<Segment>, byte_offset: u64) -> Self {
         Self {
-            buffers: send,
+            segments: send,
             byte_offset: AtomicU64::new(byte_offset),
             segment_specs: Default::default(),
+            recycled: Default::default(),
         }
     }
 
@@ -38,35 +66,39 @@ impl BufferedSegmentSink {
         let specs = self.segment_specs.lock();
         specs.clone().into()
     }
+
+    /// The pool that [`SegmentSink::new_segment`] takes segments from.
+    pub fn recycler(&self) -> SegmentRecycler {
+        self.recycled.clone()
+    }
 }
 
 #[async_trait]
 impl SegmentSink for BufferedSegmentSink {
+    fn new_segment(&self) -> Segment {
+        self.recycled.take()
+    }
+
     async fn write(
         &self,
         mut sequence_id: SequenceId,
-        buffers: Vec<ByteBuffer>,
+        mut segment: Segment,
     ) -> VortexResult<SegmentId> {
         // We wait for all segment IDs before this one to be dropped. Then while we hold a strong
         // reference to this one, we essentially have an exclusive lock on the segment writer.
         sequence_id.collapse().await;
 
-        let (segment_id, padding_buffer) = {
+        let segment_id = {
             let mut specs = self.segment_specs.lock();
             let segment_id = SegmentId::from(
                 u32::try_from(specs.len())
                     .map_err(|_| vortex_err!("Too mant segments, u32 overflow"))?,
             );
 
-            // The API requires us to write these buffers contiguously. Therefore, we can only
-            // respect the alignment of the first one.
-            // Don't worry, in most cases the caller knows what they're doing and will align the
-            // buffers themselves, inserting padding buffers where necessary.
-            let alignment = buffers
-                .first()
-                .map(|buffer| buffer.alignment())
-                .unwrap_or_else(Alignment::none);
-            let length = u32::try_from(buffers.iter().map(|buffer| buffer.len()).sum::<usize>())
+            // The segment is written contiguously, so only the alignment of its body can be
+            // respected. The serializer pads the buffers inside the body.
+            let alignment = segment.alignment();
+            let length = u32::try_from(segment.len())
                 .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
 
             // Add any padding required to align the segment.
@@ -82,20 +114,15 @@ impl SegmentSink for BufferedSegmentSink {
             self.byte_offset
                 .store(byte_offset + padding + u64::from(length), Ordering::Relaxed);
 
-            // Send the buffers to the stream.
-            if padding > 0 {
-                (segment_id, Some(ByteBuffer::zeroed(padding as usize)))
-            } else {
-                (segment_id, None)
-            }
+            segment.set_leading_zeros(
+                u32::try_from(padding)
+                    .map_err(|_| vortex_err!("segment padding exceeds maximum u32"))?,
+            );
+            segment_id
         };
 
-        if let Some(padding) = padding_buffer {
-            drop(self.buffers.send(padding).await);
-        }
-        for buffer in buffers {
-            drop(self.buffers.send(buffer).await);
-        }
+        // Send the segment to the output.
+        drop(self.segments.clone().send(segment).await);
 
         Ok(segment_id)
     }

@@ -66,12 +66,19 @@ impl<S: SegmentSource> SegmentSource for SharedSegmentSource<S> {
 #[cfg(test)]
 mod tests {
     use vortex_buffer::ByteBuffer;
+    use vortex_buffer::segment::Segment;
 
     use super::*;
     use crate::segments::CountingSegmentSource;
     use crate::segments::SegmentSink;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
+
+    fn segment_of(data: &ByteBuffer) -> Segment {
+        let mut segment = Segment::new();
+        segment.push_buffer(data.clone());
+        segment
+    }
 
     #[tokio::test]
     async fn test_shared_source_deduplicates_concurrent_requests() {
@@ -81,7 +88,10 @@ mod tests {
         // Add a segment to the test source
         let data = ByteBuffer::from(vec![1, 2, 3, 4]);
         let seq_id = SequenceId::root().downgrade();
-        segments.write(seq_id, vec![data.clone()]).await.unwrap();
+        segments
+            .write(seq_id, segment_of(&data))
+            .await
+            .unwrap();
 
         let shared_source = SharedSegmentSource::new(source.clone());
 
@@ -107,7 +117,10 @@ mod tests {
         // Add a segment
         let data = ByteBuffer::from(vec![5, 6, 7, 8]);
         let seq_id = SequenceId::root().downgrade();
-        segments.write(seq_id, vec![data.clone()]).await.unwrap();
+        segments
+            .write(seq_id, segment_of(&data))
+            .await
+            .unwrap();
 
         let shared_source = SharedSegmentSource::new(source.clone());
         let id = SegmentId::from(0);

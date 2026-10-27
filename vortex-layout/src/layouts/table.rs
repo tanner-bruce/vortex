@@ -485,10 +485,10 @@ mod tests {
         vortex.struct, dtype: {items=list({a=i32, b=i32})?}, children: 1
         └── items: vortex.list, dtype: list({a=i32, b=i32})?, children: 3
             ├── elements: vortex.struct, dtype: {a=i32, b=i32}, children: 2
-            │   ├── a: vortex.flat, dtype: i32, segment: 2
-            │   └── b: vortex.flat, dtype: i32, segment: 3
-            ├── offsets: vortex.flat, dtype: u64, segment: 0
-            └── validity: vortex.flat, dtype: bool, segment: 1
+            │   ├── a: vortex.flat, dtype: i32, segment: 0
+            │   └── b: vortex.flat, dtype: i32, segment: 1
+            ├── offsets: vortex.flat, dtype: u64, segment: 2
+            └── validity: vortex.flat, dtype: bool, segment: 3
         ");
         Ok(())
     }

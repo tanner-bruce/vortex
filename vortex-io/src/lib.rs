@@ -13,6 +13,7 @@
 pub use io_buf::*;
 pub use limit::*;
 pub use read_at::*;
+pub use segment_write::*;
 pub use write::*;
 
 pub mod compat;
@@ -24,6 +25,7 @@ pub mod object_store;
 mod read_at;
 pub mod request;
 pub mod runtime;
+mod segment_write;
 pub mod session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod std_file;

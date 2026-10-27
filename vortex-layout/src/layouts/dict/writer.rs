@@ -39,7 +39,6 @@ use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
 use crate::LayoutRef;
@@ -200,7 +199,6 @@ impl LayoutStrategy for DictStrategy {
         // Each of these pairs becomes a child dict layout.
         let runs = DictionaryTransformer::new(dict_stream);
 
-        let handle = session.handle();
         let dtype2 = dtype.clone();
         let child_layouts = stream! {
             pin_mut!(runs);
@@ -210,32 +208,30 @@ impl LayoutStrategy for DictStrategy {
                 let codes_eof = eof.split_off();
                 let ctx2 = ctx.clone();
                 let segment_sink2 = Arc::clone(&segment_sink);
-                let session2 = session.clone();
-                let codes_fut = handle.spawn_nested(move |_| async move {
+                let codes_fut = async move {
                     codes.write_stream(
                         ctx2,
                         segment_sink2,
                         codes_stream.sendable(),
                         codes_eof,
-                        &session2,
+                        session,
                     ).await
-                });
+                };
 
                 let values = Arc::clone(&self.values);
                 let values_eof = eof.split_off();
                 let ctx2 = ctx.clone();
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let dtype2 = dtype2.clone();
-                let session2 = session.clone();
-                let values_layout = handle.spawn_nested(move |_| async move {
+                let values_layout = async move {
                     values.write_stream(
                         ctx2,
                         segment_sink2,
                         SequentialStreamAdapter::new(dtype2, once(values_fut)).sendable(),
                         values_eof,
-                        &session2,
+                        session,
                     ).await
-                });
+                };
 
                 yield async move {
                     try_join!(codes_fut, values_layout)

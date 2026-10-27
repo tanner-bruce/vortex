@@ -576,6 +576,16 @@ impl<T> Buffer<T> {
         }
     }
 
+    /// Whether another buffer shares this one's storage, so dropping this one does not free it.
+    ///
+    /// Only the shared backing is counted. A buffer over [`bytes::Bytes`] reports `false` while
+    /// other `Bytes` handles may still own the same memory.
+    pub fn is_shared(&self) -> bool {
+        self.backing
+            .as_ref()
+            .is_some_and(|backing| Arc::strong_count(backing) > 1)
+    }
+
     /// Try to convert self into `BufferMut<T>` if there is only a single strong reference.
     pub fn try_into_mut(self) -> Result<BufferMut<T>, Self> {
         let Self {
