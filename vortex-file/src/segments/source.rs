@@ -280,10 +280,13 @@ pub struct FileSegmentSource {
     segments: Arc<[SegmentSpec]>,
     /// A queue for sending read request events to the I/O stream.
     events: mpsc::UnboundedSender<ReadEvent>,
-    /// Background request driver, joined by readers to surface a driver panic.
+    /// Background request driver, joined by readers to surface a driver panic. Inline, the
+    /// driver itself, polled by waiting readers.
     driver: SharedDriver,
     /// Panic payload captured if the driver panicked while driving reads.
     driver_panic: DriverPanic,
+    /// Readers poll the driver; it is not spawned.
+    inline: bool,
     /// The next read request ID.
     next_id: Arc<AtomicUsize>,
 }
@@ -331,11 +334,25 @@ impl FileSegmentSource {
         .boxed();
 
         let drive_fut = ReadDriver::new(reader, stream, concurrency, metrics).collect::<()>();
+        let driver_panic: DriverPanic = Arc::new(Mutex::new(None));
+
+        // An inline driver is polled by every waiting reader instead; a panic then unwinds the
+        // reader that was driving.
+        let inline = handle.drive_io_inline();
+        if inline {
+            return Self {
+                segments,
+                events: send,
+                driver: drive_fut.boxed().shared(),
+                driver_panic,
+                inline,
+                next_id: Arc::new(AtomicUsize::new(0)),
+            };
+        }
 
         // Spawn the driver so the runtime makes I/O progress independently of any reader. Readers
         // join it (below) only to surface a panic raised while driving reads.
         let mut task = handle.spawn(drive_fut);
-        let driver_panic: DriverPanic = Arc::new(Mutex::new(None));
         let driver = {
             let driver_panic = Arc::clone(&driver_panic);
             async move {
@@ -356,6 +373,7 @@ impl FileSegmentSource {
             events: send,
             driver,
             driver_panic,
+            inline,
             next_id: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -401,6 +419,7 @@ impl SegmentSource for FileSegmentSource {
             events: self.events.clone(),
             driver: self.driver.clone(),
             driver_panic: Arc::clone(&self.driver_panic),
+            inline: self.inline,
         };
 
         // One allocation: we only box the returned SegmentFuture, not the inner ReadFuture.
@@ -420,12 +439,20 @@ struct ReadFuture {
     events: mpsc::UnboundedSender<ReadEvent>,
     driver: SharedDriver,
     driver_panic: DriverPanic,
+    /// The reader drives the file's reads while it waits; see [`Executor::drive_io_inline`].
+    ///
+    /// [`Executor::drive_io_inline`]: vortex_io::runtime::Executor::drive_io_inline
+    inline: bool,
 }
 
 impl Future for ReadFuture {
     type Output = VortexResult<BufferHandle>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.inline && self.polled {
+            // Runs the driver until it waits on I/O or events; `cx` is woken when it can go on.
+            let _ = self.driver.poll_unpin(cx);
+        }
         match self.recv.poll_unpin(cx) {
             // note: we are skipping polled and dropped events for this if the future is ready on
             //       the first poll, that means this request was completed before it was polled,
@@ -453,6 +480,12 @@ impl Future for ReadFuture {
                 self.polled = true;
                 // Notify the I/O stream that this request has been polled.
                 match self.events.unbounded_send(ReadEvent::Polled(self.id)) {
+                    // Drive from the next poll, as a spawned driver would run after this task
+                    // yields, so requests polled together still coalesce.
+                    Ok(()) if self.inline => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                     Ok(()) => Poll::Pending,
                     Err(e) => Poll::Ready(Err(vortex_err!("ReadRequest dropped by runtime: {e}"))),
                 }
@@ -1041,6 +1074,155 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    /// An executor whose readers drive I/O; spawning anything is a test failure.
+    struct InlineOnly;
+
+    impl vortex_io::runtime::Executor for InlineOnly {
+        fn spawn(&self, _fut: BoxFuture<'static, ()>) -> vortex_io::runtime::AbortHandleRef {
+            panic!("an inline executor spawned a future")
+        }
+
+        fn spawn_cpu(
+            &self,
+            _task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> vortex_io::runtime::AbortHandleRef {
+            panic!("an inline executor spawned a CPU task")
+        }
+
+        fn spawn_blocking_io(
+            &self,
+            _task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> vortex_io::runtime::AbortHandleRef {
+            panic!("an inline executor spawned blocking I/O")
+        }
+
+        fn drive_io_inline(&self) -> bool {
+            true
+        }
+    }
+
+    /// Ranges that each complete only after their read has waited once, woken by the read itself.
+    #[derive(Clone)]
+    struct YieldingReadRanges {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl VortexReadAt for YieldingReadRanges {
+        fn concurrency(&self) -> usize {
+            2
+        }
+
+        fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+            async { Ok(32) }.boxed()
+        }
+
+        fn read_at(
+            &self,
+            _offset: u64,
+            _length: usize,
+            _alignment: Alignment,
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+            async { panic!("read_at should not be called") }.boxed()
+        }
+
+        fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> ReadAtStream {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let reads = requests
+                .iter()
+                .copied()
+                .map(|request| async move {
+                    let mut waited = false;
+                    future::poll_fn(|cx| {
+                        if waited {
+                            Poll::Ready(())
+                        } else {
+                            waited = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    let buffer = BufferHandle::new_host(
+                        ByteBuffer::from(vec![7; request.length]).aligned(request.alignment),
+                    );
+                    (request, Ok(buffer))
+                })
+                .collect::<Vec<_>>();
+            futures::stream::iter(reads).buffered(2).boxed()
+        }
+    }
+
+    fn inline_source<R: VortexReadAt + Clone>(segments: u64, reader: R) -> FileSegmentSource {
+        let segments: Arc<[SegmentSpec]> = (0..segments)
+            .map(|i| SegmentSpec {
+                offset: i * 4,
+                length: 4,
+                alignment: Alignment::none(),
+            })
+            .collect();
+        let metrics = DefaultMetricsRegistry::default();
+        let executor: Arc<dyn vortex_io::runtime::Executor> = Arc::new(InlineOnly);
+        let source = FileSegmentSource::open(
+            segments,
+            reader,
+            Handle::new(Arc::downgrade(&executor)),
+            RequestMetrics::new(&metrics, vec![]),
+        );
+        // The source holds the executor weakly; an inline source no longer needs it.
+        drop(executor);
+        source
+    }
+
+    // With no runtime at all, readers drive their own reads and coalescing still applies.
+    #[test]
+    fn inline_driver_reads_without_spawning_and_coalesces() -> VortexResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = inline_source(
+            4,
+            ReadRangesOnly {
+                calls: Arc::clone(&calls),
+            },
+        );
+        let results = futures::executor::block_on(future::join_all(
+            (0..4).map(|i| source.request(SegmentId::from(i))),
+        ));
+        for result in results {
+            assert_eq!(result?.len(), 4);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    // Reads that wait are resumed through the reader's waker, one at a time or together.
+    #[test]
+    fn inline_driver_resumes_waiting_readers() -> VortexResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = inline_source(
+            8,
+            YieldingReadRanges {
+                calls: Arc::clone(&calls),
+            },
+        );
+        for i in 0..4 {
+            let buffer = futures::executor::block_on(source.request(SegmentId::from(i)))?;
+            assert_eq!(buffer.len(), 4);
+        }
+        let results = futures::executor::block_on(future::join_all(
+            (4..8).map(|i| source.request(SegmentId::from(i))),
+        ));
+        for result in results {
+            assert_eq!(result?.len(), 4);
+        }
+        assert!(calls.load(Ordering::Relaxed) >= 5);
+        // A dropped reader cancels its request and leaves the others able to drive.
+        drop(source.request(SegmentId::from(0)));
+        assert_eq!(
+            futures::executor::block_on(source.request(SegmentId::from(1)))?.len(),
+            4
+        );
+        Ok(())
     }
 
     // Many segment reads driven on separate tasks must all make progress and complete.

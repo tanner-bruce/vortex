@@ -42,6 +42,14 @@ impl Handle {
         })
     }
 
+    /// Whether I/O drivers run inside the futures that wait on them; see
+    /// [`Executor::drive_io_inline`]. False once the runtime is gone.
+    pub fn drive_io_inline(&self) -> bool {
+        self.runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.drive_io_inline())
+    }
+
     /// Returns a handle to the current runtime, if such a reasonable choice exists.
     ///
     /// For example, if called from within a Tokio context this will return a
