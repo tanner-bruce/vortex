@@ -78,6 +78,16 @@ pub trait Executor: Send + Sync {
     /// The returned `AbortHandle` may be used to optimistically cancel the task if it has not
     /// yet started executing.
     fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
+
+    /// Whether I/O drivers should run inside the futures that wait on them rather than as spawned
+    /// tasks.
+    ///
+    /// An executor whose work is owned and polled by one task, such as a job on a thread-per-core
+    /// worker, returns `true`: a file's read driver is then polled by its readers while they wait,
+    /// so reads make progress without a second task. By default drivers are spawned.
+    fn drive_io_inline(&self) -> bool {
+        false
+    }
 }
 
 /// A handle that may be used to optimistically abort a spawned task.
