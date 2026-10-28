@@ -42,12 +42,12 @@ impl Handle {
         })
     }
 
-    /// Whether I/O drivers run inside the futures that wait on them; see
-    /// [`Executor::drive_io_inline`]. False once the runtime is gone.
-    pub fn drive_io_inline(&self) -> bool {
+    /// Whether futures spawned only for a waiting caller run inside its poll instead; see
+    /// [`Executor::run_inline`]. False once the runtime is gone.
+    pub fn run_inline(&self) -> bool {
         self.runtime
             .upgrade()
-            .is_some_and(|runtime| runtime.drive_io_inline())
+            .is_some_and(|runtime| runtime.run_inline())
     }
 
     /// Returns a handle to the current runtime, if such a reasonable choice exists.

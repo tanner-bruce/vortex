@@ -79,13 +79,14 @@ pub trait Executor: Send + Sync {
     /// yet started executing.
     fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
 
-    /// Whether I/O drivers should run inside the futures that wait on them rather than as spawned
-    /// tasks.
+    /// Whether futures Vortex spawns only so that a waiting caller makes progress, such as a
+    /// file's read driver or a scan's split tasks, should instead run inside that caller's poll.
     ///
     /// An executor whose work is owned and polled by one task, such as a job on a thread-per-core
-    /// worker, returns `true`: a file's read driver is then polled by its readers while they wait,
-    /// so reads make progress without a second task. By default drivers are spawned.
-    fn drive_io_inline(&self) -> bool {
+    /// worker, returns `true`: readers then poll the read driver while they wait and a scan stream
+    /// polls its splits, so nothing needs a second task. CPU work offered through
+    /// [`Executor::spawn_cpu`] is unaffected. By default such futures are spawned.
+    fn run_inline(&self) -> bool {
         false
     }
 }

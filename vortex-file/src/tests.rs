@@ -126,7 +126,9 @@ use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
 use crate::flatbuffers::footer as fb;
 use crate::footer::SegmentSpec;
-static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+static SESSION: LazyLock<VortexSession> = LazyLock::new(new_session);
+
+fn new_session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
@@ -135,7 +137,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     crate::enable_all_registered_array_encodings(&session);
 
     session
-});
+}
 
 fn pruning_aggregate_fns() -> Vec<AggregateFnRef> {
     [Stat::Min, Stat::Max, Stat::NullCount, Stat::NaNCount]
@@ -3476,4 +3478,83 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
 
     assert_arrays_eq!(result, mk_struct(vec![big])?, &mut ctx);
     Ok(())
+}
+
+/// Runs CPU work where it is offered and refuses to spawn futures, as a thread-per-core job's
+/// executor would; readers and scans must then run inline.
+struct InlineExecutor;
+
+struct Ran;
+
+impl vortex_io::runtime::AbortHandle for Ran {
+    fn abort(self: Box<Self>) {}
+}
+
+impl vortex_io::runtime::Executor for InlineExecutor {
+    fn spawn(
+        &self,
+        _fut: futures::future::BoxFuture<'static, ()>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        panic!("an inline executor spawned a future")
+    }
+
+    fn spawn_cpu(
+        &self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        task();
+        Box::new(Ran)
+    }
+
+    fn spawn_blocking_io(
+        &self,
+        _task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        panic!("an inline executor spawned blocking I/O")
+    }
+
+    fn run_inline(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn file_reads_and_scans_run_inline_without_spawning() {
+    use vortex_io::runtime::Handle;
+    use vortex_io::session::RuntimeSessionExt;
+
+    let numbers = ChunkedArray::from_iter([
+        buffer![1u32, 2, 3, 4].into_array(),
+        buffer![5u32, 6, 7, 8].into_array(),
+    ])
+    .into_array();
+    let st = StructArray::from_fields(&[("numbers", numbers)]).unwrap();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.into_array().to_array_stream())
+        .await
+        .unwrap();
+    let buffer = buf.freeze();
+
+    // No Tokio context on this thread: every read and split is polled by the scan's consumer.
+    std::thread::spawn(move || {
+        let executor: Arc<dyn vortex_io::runtime::Executor> = Arc::new(InlineExecutor);
+        // A session of its own: a clone of `SESSION` would share the handle it installs.
+        let session = new_session().with_handle(Handle::new(Arc::downgrade(&executor)));
+        let rows = futures::executor::block_on(async {
+            let file = session.open_options().open_read(buffer).await.unwrap();
+            let stream = file.scan().unwrap().into_array_stream().unwrap();
+            pin_mut!(stream);
+            let mut rows = 0;
+            while let Some(array) = stream.next().await {
+                rows += array.unwrap().len();
+            }
+            rows
+        });
+        assert_eq!(rows, 8);
+    })
+    .join()
+    .unwrap();
 }
