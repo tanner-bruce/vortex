@@ -338,7 +338,7 @@ impl FileSegmentSource {
 
         // An inline driver is polled by every waiting reader instead; a panic then unwinds the
         // reader that was driving.
-        let inline = handle.drive_io_inline();
+        let inline = handle.run_inline();
         if inline {
             return Self {
                 segments,
@@ -439,9 +439,9 @@ struct ReadFuture {
     events: mpsc::UnboundedSender<ReadEvent>,
     driver: SharedDriver,
     driver_panic: DriverPanic,
-    /// The reader drives the file's reads while it waits; see [`Executor::drive_io_inline`].
+    /// The reader drives the file's reads while it waits; see [`Executor::run_inline`].
     ///
-    /// [`Executor::drive_io_inline`]: vortex_io::runtime::Executor::drive_io_inline
+    /// [`Executor::run_inline`]: vortex_io::runtime::Executor::run_inline
     inline: bool,
 }
 
@@ -1098,7 +1098,7 @@ mod tests {
             panic!("an inline executor spawned blocking I/O")
         }
 
-        fn drive_io_inline(&self) -> bool {
+        fn run_inline(&self) -> bool {
             true
         }
     }
