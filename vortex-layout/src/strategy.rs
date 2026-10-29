@@ -14,6 +14,7 @@ use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::LayoutId;
 use crate::LayoutRef;
+use crate::layouts::zoned::writer::ZoneDeferral;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
 use crate::sequence::SequencePointer;
@@ -79,6 +80,7 @@ pub struct LayoutWriterContext {
     allowed_layouts: Option<Arc<HashSet<LayoutId>>>,
     nullable_ancestor: bool,
     buffered_bytes: BufferedBytesTracker,
+    zone_deferral: Option<ZoneDeferral>,
 }
 
 impl LayoutWriterContext {
@@ -90,7 +92,27 @@ impl LayoutWriterContext {
             allowed_layouts: None,
             nullable_ancestor: false,
             buffered_bytes: BufferedBytesTracker::new(),
+            zone_deferral: None,
         }
+    }
+
+    /// Defer every zone map in this write: zoned strategies keep their per-zone partials in
+    /// `deferral` and return their data child, so a later stitch can build one zone table from
+    /// the partials of several range writes.
+    pub fn with_zone_deferral(mut self, deferral: ZoneDeferral) -> Self {
+        self.zone_deferral = Some(deferral);
+        self
+    }
+
+    /// The deferral zone maps go to, if this write defers them.
+    pub fn zone_deferral(&self) -> Option<&ZoneDeferral> {
+        self.zone_deferral.as_ref()
+    }
+
+    /// This context without zone deferral, for writes that must emit their tables.
+    pub fn without_zone_deferral(mut self) -> Self {
+        self.zone_deferral = None;
+        self
     }
 
     /// Restrict the aggregate functions this write may record, e.g. in a zone map.
