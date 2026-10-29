@@ -433,38 +433,38 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                     let num_workers = get_available_parallelism().unwrap_or(1);
                     let concurrency = builder.concurrency * num_workers;
                     let handle = builder.session.handle();
-                    let task = handle
-                        .spawn_cpu(move || builder.prepare().and_then(|scan| scan.execute(None)));
-                    self.state = LazyScanState::Preparing(PreparingScan {
-                        ordered,
-                        concurrency,
-                        handle,
-                        task,
-                    });
+                    let prepare = move || builder.prepare().and_then(|scan| scan.execute(None));
+                    // Inline, the caller's poll prepares the scan, so a scan over resident
+                    // segments completes without waiting on a CPU task run elsewhere.
+                    self.state = if handle.run_inline() {
+                        match prepare() {
+                            Ok(tasks) => LazyScanState::Stream(split_stream(
+                                tasks,
+                                ordered,
+                                concurrency,
+                                handle,
+                            )),
+                            Err(err) => LazyScanState::Error(Some(err)),
+                        }
+                    } else {
+                        let task = handle.spawn_cpu(prepare);
+                        LazyScanState::Preparing(PreparingScan {
+                            ordered,
+                            concurrency,
+                            handle,
+                            task,
+                        })
+                    };
                 }
                 LazyScanState::Preparing(preparing) => {
                     match ready!(Pin::new(&mut preparing.task).poll(cx)) {
                         Ok(tasks) => {
-                            let ordered = preparing.ordered;
-                            let concurrency = preparing.concurrency;
-                            let handle = preparing.handle.clone();
-                            // Inline, the stream polls each split in place of a spawned task.
-                            let inline = handle.run_inline();
-                            let stream = futures::stream::iter(tasks).map(move |task| {
-                                if inline {
-                                    Either::Left(task)
-                                } else {
-                                    Either::Right(handle.spawn(task))
-                                }
-                            });
-                            let stream = if ordered {
-                                stream.buffered(concurrency).boxed()
-                            } else {
-                                stream.buffer_unordered(concurrency).boxed()
-                            };
-                            let stream = stream
-                                .filter_map(|chunk| async move { chunk.transpose() })
-                                .boxed();
+                            let stream = split_stream(
+                                tasks,
+                                preparing.ordered,
+                                preparing.concurrency,
+                                preparing.handle.clone(),
+                            );
                             self.state = LazyScanState::Stream(stream);
                         }
                         Err(err) => self.state = LazyScanState::Error(Some(err)),
@@ -475,6 +475,32 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
             }
         }
     }
+}
+
+/// The stream of a prepared scan's split results.
+fn split_stream<A: 'static + Send>(
+    tasks: PreparedScanTasks<A>,
+    ordered: bool,
+    concurrency: usize,
+    handle: Handle,
+) -> BoxStream<'static, VortexResult<A>> {
+    // Inline, the stream polls each split in place of a spawned task.
+    let inline = handle.run_inline();
+    let stream = futures::stream::iter(tasks).map(move |task| {
+        if inline {
+            Either::Left(task)
+        } else {
+            Either::Right(handle.spawn(task))
+        }
+    });
+    let stream = if ordered {
+        stream.buffered(concurrency).boxed()
+    } else {
+        stream.buffer_unordered(concurrency).boxed()
+    };
+    stream
+        .filter_map(|chunk| async move { chunk.transpose() })
+        .boxed()
 }
 
 /// Compute masks of field paths referenced by the projection and filter in the scan.

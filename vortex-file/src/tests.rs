@@ -2847,15 +2847,9 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     Ok(())
 }
 
-/// Runs CPU work where it is offered and refuses to spawn futures, as a thread-per-core job's
-/// executor would; readers and scans must then run inline.
+/// Refuses to spawn futures or CPU work, as a thread-per-core job's executor would for work that
+/// must stay in the caller's poll; readers and scans must then run inline.
 struct InlineExecutor;
-
-struct Ran;
-
-impl vortex_io::runtime::AbortHandle for Ran {
-    fn abort(self: Box<Self>) {}
-}
 
 impl vortex_io::runtime::Executor for InlineExecutor {
     fn spawn(
@@ -2867,10 +2861,9 @@ impl vortex_io::runtime::Executor for InlineExecutor {
 
     fn spawn_cpu(
         &self,
-        task: Box<dyn FnOnce() + Send + 'static>,
+        _task: Box<dyn FnOnce() + Send + 'static>,
     ) -> vortex_io::runtime::AbortHandleRef {
-        task();
-        Box::new(Ran)
+        panic!("an inline scan offered its preparation as a CPU task")
     }
 
     fn spawn_blocking_io(
