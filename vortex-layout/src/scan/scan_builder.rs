@@ -426,8 +426,17 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                     // task: poll_next must only wait for and poll an already-constructed stream.
                     // This also keeps construction errors on the Preparing -> Error path rather
                     // than running construction on the caller's executor.
-                    let task = handle.spawn_cpu(move || builder.prepare()?.execute_stream(None));
-                    self.state = LazyScanState::Preparing(task);
+                    let prepare = move || builder.prepare()?.execute_stream(None);
+                    // Inline, the caller's poll prepares the scan, so a scan over resident
+                    // segments completes without waiting on a CPU task run elsewhere.
+                    self.state = if handle.run_inline() {
+                        match prepare() {
+                            Ok(stream) => LazyScanState::Stream(stream),
+                            Err(err) => LazyScanState::Error(Some(err)),
+                        }
+                    } else {
+                        LazyScanState::Preparing(handle.spawn_cpu(prepare))
+                    };
                 }
                 LazyScanState::Preparing(task) => match ready!(Pin::new(task).poll(cx)) {
                     Ok(stream) => self.state = LazyScanState::Stream(stream),

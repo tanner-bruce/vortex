@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn preserves_existing_view_prefixes_in_dictionary_analysis() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // Safe view construction accepts unused inline padding. Preserve the
         // existing estimator's raw prefixes even when the logical values agree.
         let views = (1_u128..=4)
