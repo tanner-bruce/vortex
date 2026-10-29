@@ -25,9 +25,11 @@ use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::aggregate_fn::fns::null_count::NullCount;
 use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
 use vortex_array::dtype::DType;
+use vortex_array::scalar::Scalar;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
@@ -117,7 +119,7 @@ impl LayoutStrategy for ZonedStrategy {
         mut eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
-        let aggregate_fns = self
+        let requested_fns = self
             .options
             .aggregate_fns
             .clone()
@@ -126,7 +128,7 @@ impl LayoutStrategy for ZonedStrategy {
 
         let stats_accumulator = Arc::new(Mutex::new(AggregateStatsAccumulator::new(
             stream.dtype(),
-            &aggregate_fns,
+            &requested_fns,
         )));
         // The accumulator has dropped the aggregates this dtype cannot hold, leaving the ones
         // this write would record. An aggregate the context forbids fails the write, like a
@@ -137,6 +139,21 @@ impl LayoutStrategy for ZonedStrategy {
             if !ctx.allows_aggregate(&aggregate_fn.id()) {
                 vortex_bail!("Aggregate {} not permitted by ctx", aggregate_fn.id());
             }
+        }
+
+        if let Some(deferral) = ctx.zone_deferral() {
+            return self
+                .write_deferred(
+                    ctx.clone(),
+                    deferral.clone(),
+                    segment_sink,
+                    stream,
+                    eof,
+                    session,
+                    requested_fns,
+                    aggregate_fns,
+                )
+                .await;
         }
 
         let stream_dtype = stream.dtype().clone();
@@ -215,6 +232,171 @@ impl LayoutStrategy for ZonedStrategy {
                 .into_layout(),
         )
     }
+}
+
+impl ZonedStrategy {
+    /// Write the data child and keep the per-zone partials in `deferral` instead of writing the
+    /// zone table. The returned layout is the bare data child; [`write_deferred_zones`] wraps the
+    /// stitched data child once every range's partials are known, because whether an aggregate
+    /// is kept depends on all zones of the file.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cold path: once per column per range write; mirrors write_stream's arguments"
+    )]
+    async fn write_deferred(
+        &self,
+        ctx: LayoutWriterContext,
+        deferral: ZoneDeferral,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        mut eof: SequencePointer,
+        session: &VortexSession,
+        requested_fns: Arc<[AggregateFnRef]>,
+        aggregate_fns: Arc<[AggregateFnRef]>,
+    ) -> VortexResult<LayoutRef> {
+        let stream_dtype = stream.dtype().clone();
+        let concurrency = self.options.concurrency.get();
+        let task_lifetime = self.task_lifetime.clone();
+        let compute_session = session.clone();
+        let stream = stream
+            .map(move |item| {
+                let aggregate_fns = Arc::clone(&aggregate_fns);
+                let session = compute_session.clone();
+                let task_lifetime = task_lifetime.clone();
+                session.handle().spawn_cpu(move || {
+                    let _task_lifetime = task_lifetime;
+                    let (sequence_id, chunk) = item?;
+                    let partials = aggregate_partials(
+                        &chunk,
+                        &aggregate_fns,
+                        &mut session.create_execution_ctx(),
+                    )?;
+                    Ok::<_, VortexError>((sequence_id, chunk, partials))
+                })
+            })
+            .buffered(concurrency);
+
+        let partials = Arc::new(Mutex::new(Vec::<Vec<Scalar>>::new()));
+        let partials2 = Arc::clone(&partials);
+        let stream = SequentialStreamAdapter::new(
+            stream_dtype.clone(),
+            stream.map(move |item| {
+                let (sequence_id, chunk, chunk_partials) = item?;
+                partials2.lock().push(chunk_partials);
+                Ok((sequence_id, chunk))
+            }),
+        )
+        .sendable();
+
+        let data_eof = eof.split_off();
+        let data_layout = self
+            .child
+            .write_stream(ctx, segment_sink, stream, data_eof, session)
+            .await?;
+        let partials = std::mem::take(&mut *partials.lock());
+        deferral.0.lock().push(DeferredZones {
+            data: Arc::clone(&data_layout),
+            dtype: stream_dtype,
+            requested_fns,
+            zone_len: self.options.block_size,
+            stats: Arc::clone(&self.stats),
+            partials,
+        });
+        Ok(data_layout)
+    }
+}
+
+/// The zone maps a range write deferred, in the order its zoned strategies finished.
+///
+/// Each entry is keyed by the data layout it belongs to; [`DeferredZones::data`] is the same
+/// reference that sits in the range's layout tree.
+#[derive(Clone, Default)]
+pub struct ZoneDeferral(Arc<Mutex<Vec<DeferredZones>>>);
+
+impl ZoneDeferral {
+    /// Take every deferred zone map recorded so far.
+    pub fn take(&self) -> Vec<DeferredZones> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
+/// One zoned strategy's data child and per-zone partials from one range write.
+pub struct DeferredZones {
+    data: LayoutRef,
+    dtype: DType,
+    requested_fns: Arc<[AggregateFnRef]>,
+    zone_len: NonZeroUsize,
+    stats: Arc<dyn LayoutStrategy>,
+    partials: Vec<Vec<Scalar>>,
+}
+
+impl DeferredZones {
+    /// The data child this zone map annotates, as it appears in the range's layout tree.
+    pub fn data(&self) -> &LayoutRef {
+        &self.data
+    }
+
+    /// Zones (chunks) recorded.
+    pub fn nzones(&self) -> usize {
+        self.partials.len()
+    }
+}
+
+/// Build one zoned layout over `data` from the deferred partials of consecutive range writes.
+///
+/// The partials are replayed in order into one accumulator, exactly as a single write would have
+/// pushed them, so the aggregates kept, the table and its segment are the single write's.
+pub async fn write_deferred_zones(
+    parts: Vec<DeferredZones>,
+    data: LayoutRef,
+    ctx: LayoutWriterContext,
+    segment_sink: SegmentSinkRef,
+    mut eof: SequencePointer,
+    session: &VortexSession,
+) -> VortexResult<LayoutRef> {
+    let Some(first) = parts.first() else {
+        vortex_bail!("a deferred zone map needs at least one range");
+    };
+    let dtype = first.dtype.clone();
+    let requested_fns = Arc::clone(&first.requested_fns);
+    let zone_len = first.zone_len;
+    let stats = Arc::clone(&first.stats);
+    vortex_ensure!(
+        &dtype == data.dtype(),
+        "deferred zone map dtype {} differs from the stitched data {}",
+        dtype,
+        data.dtype()
+    );
+    let mut accumulator = AggregateStatsAccumulator::new(&dtype, &requested_fns);
+    for part in parts {
+        vortex_ensure!(
+            part.dtype == dtype
+                && part.zone_len == zone_len
+                && part.requested_fns.len() == requested_fns.len()
+                && part
+                    .requested_fns
+                    .iter()
+                    .zip(requested_fns.iter())
+                    .all(|(left, right)| left.to_string() == right.to_string()),
+            "range zone maps disagree on dtype, zone length or aggregates"
+        );
+        for partials in part.partials {
+            accumulator.push_partials(partials)?;
+        }
+    }
+    let mut exec_ctx = session.create_execution_ctx();
+    let Some((stats_array, aggregate_fns)) = accumulator.as_array(&mut exec_ctx)? else {
+        return Ok(data);
+    };
+    let stats_stream = stats_array
+        .into_array()
+        .to_array_stream()
+        .sequenced(eof.split_off());
+    let ctx = ctx.without_zone_deferral();
+    let zones_layout = stats
+        .write_stream(ctx, segment_sink, stats_stream, eof, session)
+        .await?;
+    Ok(ZonedLayout::try_new(data, zones_layout, zone_len, aggregate_fns)?.into_layout())
 }
 
 fn default_zoned_aggregate_fns(dtype: &DType, session: &VortexSession) -> Arc<[AggregateFnRef]> {
