@@ -51,6 +51,7 @@ use vortex_io::SegmentWrite;
 use vortex_io::VortexWrite;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::write_segment_to;
+use vortex_layout::BufferedBytesReservation;
 use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
 use vortex_layout::LayoutRef;
@@ -440,8 +441,9 @@ impl VortexWriteOptions {
     /// [`Self::write_stitched`].
     ///
     /// The stream must start and end on zone boundaries of the file's zoned strategies. The
-    /// range keeps its segments in memory, numbered from 0, and defers every zone map. The file
-    /// options must not ask for file statistics, which would need every range's rows.
+    /// range keeps its segments in memory, numbered from 0, and defers every zone map. Each kept
+    /// segment counts on [`Self::buffered_bytes_tracker`] until a stitched write places it. The
+    /// file options must not ask for file statistics, which would need every range's rows.
     pub async fn write_range<S: ArrayStream + Send + 'static>(
         self,
         stream: S,
@@ -465,7 +467,10 @@ impl VortexWriteOptions {
                 .map(move |result| result.map(|chunk| (ptr.advance(), chunk))),
         )
         .sendable();
-        let sink = Arc::new(RangeSegmentSink::default());
+        let sink = Arc::new(RangeSegmentSink {
+            segments: parking_lot::Mutex::default(),
+            tracker: self.buffered_bytes.clone(),
+        });
         let layout = strategy
             .write_stream(
                 ctx.clone(),
@@ -963,7 +968,7 @@ impl<W: SegmentWrite + Send + Unpin> SegmentOutput for SegmentWriteOutput<W> {
 /// its deferred zone maps.
 pub struct RangeWrite {
     layout: LayoutRef,
-    segments: Vec<Segment>,
+    segments: Vec<(Segment, BufferedBytesReservation)>,
     zones: Vec<DeferredZones>,
     array_ids: Vec<Id>,
 }
@@ -981,7 +986,7 @@ impl RangeWrite {
 
     /// Bytes of the range's segment bodies, without padding.
     pub fn body_bytes(&self) -> u64 {
-        self.segments.iter().map(Segment::len).sum()
+        self.segments.iter().map(|(segment, _)| segment.len()).sum()
     }
 }
 
@@ -1013,9 +1018,10 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
             vortex_bail!("a range write interned array encodings the file context lacks");
         }
         let first_segment_id = self.sink.next_id()?;
-        for mut segment in range.segments {
+        for (mut segment, held) in range.segments {
             self.sink.place(&mut segment)?;
             self.output.write(segment).await?;
+            drop(held);
         }
         self.layouts.push(RangeLayout {
             layout: range.layout,
@@ -1089,10 +1095,11 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
     }
 }
 
-/// Keeps a range's segments in sequence order, numbered from 0.
-#[derive(Default)]
+/// Keeps a range's segments in sequence order, numbered from 0, each counted as buffered on
+/// the write's tracker until it is placed.
 struct RangeSegmentSink {
-    segments: parking_lot::Mutex<Vec<Segment>>,
+    segments: parking_lot::Mutex<Vec<(Segment, BufferedBytesReservation)>>,
+    tracker: BufferedBytesTracker,
 }
 
 #[async_trait::async_trait]
@@ -1103,9 +1110,10 @@ impl SegmentSink for RangeSegmentSink {
         segment: Segment,
     ) -> VortexResult<SegmentId> {
         sequence_id.collapse().await;
+        let held = self.tracker.reserve(segment.len());
         let mut segments = self.segments.lock();
         let segment_id = SegmentId::try_from(segments.len())?;
-        segments.push(segment);
+        segments.push((segment, held));
         Ok(segment_id)
     }
 }
