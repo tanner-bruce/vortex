@@ -432,100 +432,40 @@ impl VortexWriteOptions {
         write: W,
         ranges: Vec<RangeWrite>,
     ) -> VortexResult<WriteSummary> {
-        self.write_stitched_internal(WriteOutput(write), ranges)
-            .await
+        let mut stitched = self.begin_stitched(write).await?;
+        for range in ranges {
+            stitched.push(range).await?;
+        }
+        stitched.finish().await
     }
 
-    async fn write_stitched_internal<O: SegmentOutput>(
+    /// Start a stitched write: the file magic goes out now, each range's segments when it is
+    /// [pushed](StitchedWriter::push), and the zone tables and footer at
+    /// [finish](StitchedWriter::finish). An earlier range can be written while later ones are
+    /// still being encoded.
+    pub async fn begin_stitched<W: VortexWrite + Unpin>(
         self,
-        mut output: O,
-        ranges: Vec<RangeWrite>,
-    ) -> VortexResult<WriteSummary> {
+        write: W,
+    ) -> VortexResult<StitchedWriter<W>> {
         validate_metadata_segments(&self.metadata)?;
         if !self.file_statistics.is_empty() {
             vortex_bail!("a stitched write cannot record file statistics");
         }
         let enforce_editions = !self.disable_editions;
         let (ctx, _) = self.layout_setup(enforce_editions);
-        let Some(first) = ranges.first() else {
-            vortex_bail!("a stitched write needs at least one range");
-        };
-        let dtype = first.layout.dtype().clone();
         let array_ids = ctx.array_ctx().to_ids();
-        for range in &ranges {
-            if range.layout.dtype() != &dtype {
-                vortex_bail!("stitched ranges disagree on dtype");
-            }
-            if range.array_ids != array_ids {
-                vortex_bail!("a range write interned array encodings the file context lacks");
-            }
-        }
-
+        let mut output = WriteOutput(write);
         let mut magic = Segment::new();
         magic.push_framing_bytes(&MAGIC_BYTES);
         output.write(magic).await?;
-        let sink = Arc::new(StitchSegmentSink::new(MAGIC_BYTES.len() as u64));
-
-        let mut layouts = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let first_segment_id = sink.next_id()?;
-            for mut segment in range.segments {
-                sink.place(&mut segment)?;
-                output.write(segment).await?;
-            }
-            layouts.push(RangeLayout {
-                layout: range.layout,
-                zones: range.zones,
-                first_segment_id,
-            });
-        }
-
-        let (_, eof) = SequenceId::root().split();
-        let layout = stitch_range_layouts(
-            layouts,
-            ctx.clone(),
-            Arc::<StitchSegmentSink>::clone(&sink),
-            eof,
-            &self.session,
-        )
-        .await?;
-        let zone_segments = std::mem::take(&mut *sink.held.lock());
-        for segment in zone_segments {
-            output.write(segment).await?;
-        }
-        if ctx.array_ctx().to_ids() != array_ids {
-            vortex_bail!("the stitched zone tables interned array encodings after the ranges");
-        }
-        let (segment_specs, mut position) = {
-            let placement = sink.placement.lock();
-            (placement.specs.clone(), placement.position)
-        };
-
-        let mut footer = Footer::new(
-            Arc::clone(&layout),
-            segment_specs.into(),
-            None,
-            ReadContext::new(array_ids),
-        );
-        let (footer_segment, metadata, approx_byte_size) = footer
-            .clone()
-            .into_serializer()
-            .with_layout_context(new_layout_context(&self.session, enforce_editions))
-            .with_metadata_segments(self.metadata)
-            .with_offset(position)
-            .with_exclude_dtype(self.exclude_dtype)
-            .serialize_with_metadata()?;
-        footer = footer
-            .with_metadata_segments(metadata)
-            .with_approx_byte_size(approx_byte_size);
-
-        position += footer_segment.padded_len();
-        output.write(footer_segment).await?;
-        output.flush().await?;
-
-        Ok(WriteSummary {
-            footer,
-            size: position,
+        Ok(StitchedWriter {
+            options: self,
+            output,
+            ctx,
+            array_ids,
+            sink: Arc::new(StitchSegmentSink::new(MAGIC_BYTES.len() as u64)),
+            layouts: Vec::new(),
+            enforce_editions,
         })
     }
 
@@ -972,6 +912,110 @@ impl RangeWrite {
     /// Bytes of the range's segment bodies, without padding.
     pub fn body_bytes(&self) -> u64 {
         self.segments.iter().map(Segment::len).sum()
+    }
+}
+
+/// A stitched write in progress, from [`VortexWriteOptions::begin_stitched`].
+pub struct StitchedWriter<W> {
+    options: VortexWriteOptions,
+    output: WriteOutput<W>,
+    ctx: LayoutWriterContext,
+    array_ids: Vec<Id>,
+    sink: Arc<StitchSegmentSink>,
+    layouts: Vec<RangeLayout>,
+    enforce_editions: bool,
+}
+
+impl<W: VortexWrite + Unpin> StitchedWriter<W> {
+    /// Bytes placed so far: the magic and every pushed range's padded segments.
+    pub fn position(&self) -> u64 {
+        self.sink.placement.lock().position
+    }
+
+    /// Place and write the next range's segments after the ones before it.
+    pub async fn push(&mut self, range: RangeWrite) -> VortexResult<()> {
+        if let Some(first) = self.layouts.first() {
+            if range.layout.dtype() != first.layout.dtype() {
+                vortex_bail!("stitched ranges disagree on dtype");
+            }
+        }
+        if range.array_ids != self.array_ids {
+            vortex_bail!("a range write interned array encodings the file context lacks");
+        }
+        let first_segment_id = self.sink.next_id()?;
+        for mut segment in range.segments {
+            self.sink.place(&mut segment)?;
+            self.output.write(segment).await?;
+        }
+        self.layouts.push(RangeLayout {
+            layout: range.layout,
+            zones: range.zones,
+            first_segment_id,
+        });
+        Ok(())
+    }
+
+    /// Write the zone tables and the footer of the joined tree.
+    pub async fn finish(self) -> VortexResult<WriteSummary> {
+        let Self {
+            options,
+            mut output,
+            ctx,
+            array_ids,
+            sink,
+            layouts,
+            enforce_editions,
+        } = self;
+        if layouts.is_empty() {
+            vortex_bail!("a stitched write needs at least one range");
+        }
+        let (_, eof) = SequenceId::root().split();
+        let layout = stitch_range_layouts(
+            layouts,
+            ctx.clone(),
+            Arc::<StitchSegmentSink>::clone(&sink),
+            eof,
+            &options.session,
+        )
+        .await?;
+        let zone_segments = std::mem::take(&mut *sink.held.lock());
+        for segment in zone_segments {
+            output.write(segment).await?;
+        }
+        if ctx.array_ctx().to_ids() != array_ids {
+            vortex_bail!("the stitched zone tables interned array encodings after the ranges");
+        }
+        let (segment_specs, mut position) = {
+            let placement = sink.placement.lock();
+            (placement.specs.clone(), placement.position)
+        };
+
+        let mut footer = Footer::new(
+            Arc::clone(&layout),
+            segment_specs.into(),
+            None,
+            ReadContext::new(array_ids),
+        );
+        let (footer_segment, metadata, approx_byte_size) = footer
+            .clone()
+            .into_serializer()
+            .with_layout_context(new_layout_context(&options.session, enforce_editions))
+            .with_metadata_segments(options.metadata)
+            .with_offset(position)
+            .with_exclude_dtype(options.exclude_dtype)
+            .serialize_with_metadata()?;
+        footer = footer
+            .with_metadata_segments(metadata)
+            .with_approx_byte_size(approx_byte_size);
+
+        position += footer_segment.padded_len();
+        output.write(footer_segment).await?;
+        output.flush().await?;
+
+        Ok(WriteSummary {
+            footer,
+            size: position,
+        })
     }
 }
 
