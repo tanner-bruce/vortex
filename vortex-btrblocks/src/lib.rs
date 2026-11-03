@@ -81,6 +81,7 @@ pub use builder::BtrBlocksCompressorBuilder;
 pub use canonical_compressor::BtrBlocksCompressor;
 pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
+pub use vortex_compressor::PlanCounts;
 pub use vortex_compressor::SchemePlan;
 pub use vortex_compressor::StringDictionaryCapacity;
 pub use vortex_compressor::StringDictionaryMemoryShape;

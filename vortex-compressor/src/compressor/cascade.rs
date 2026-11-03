@@ -36,6 +36,7 @@ use vortex_error::VortexResult;
 
 use super::CascadingCompressor;
 use super::constant;
+use super::plan;
 use super::plan::Planned;
 use super::plan::site;
 use super::plan::with_site;
@@ -66,7 +67,15 @@ impl CascadingCompressor {
         let span = trace::compress_span(array.len(), array.dtype(), before_nbytes);
         let _enter = span.enter();
 
-        let compressed = self.compress_input(array, CompressorContext::new(), exec_ctx)?;
+        let compressed = match &self.plan {
+            Some(plan) if plan::is_top_level() => {
+                let before = plan::thread_fallbacks();
+                let compressed = self.compress_input(array, CompressorContext::new(), exec_ctx)?;
+                plan.chunk(plan::thread_fallbacks() != before);
+                compressed
+            }
+            _ => self.compress_input(array, CompressorContext::new(), exec_ctx)?,
+        };
 
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
@@ -135,24 +144,16 @@ impl CascadingCompressor {
                 let dict = dict.into_owned();
                 let mut compress_ctx = compress_ctx;
                 compress_ctx.logical_strings = true;
-                let mut packed_nbytes = 0;
-                let (data, eligible, planned, opts) =
-                    self.prepare_planned(eligible, &compress_ctx, exec_ctx, |opts, exec_ctx| {
-                        let prepared = strings::analyze_dictionary(&dict, opts, exec_ctx)?;
-                        packed_nbytes = prepared.packed_nbytes;
-                        Ok(ArrayAndStats::new_dictionary(
-                            prepared.array,
-                            opts,
-                            prepared.stats,
-                        ))
-                    })?;
-                return self.choose_prepared(
-                    data,
+                return self.compress_planned(
                     eligible,
-                    packed_nbytes,
-                    compress_ctx.with_merged_stats_options(opts),
-                    planned,
+                    &compress_ctx,
                     exec_ctx,
+                    |opts, exec_ctx| {
+                        let prepared = strings::analyze_dictionary(&dict, opts, exec_ctx)?;
+                        let data =
+                            ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
+                        Ok((data, prepared.packed_nbytes))
+                    },
                 );
             }
         }
@@ -340,48 +341,39 @@ impl CascadingCompressor {
         compress_ctx.logical_strings = logical_strings;
         // A replayed site keeps the full list's logical-strings choice above, but generates only
         // the replayed winner's statistics.
-        let (data, eligible_schemes, planned, merged_opts) =
-            self.prepare_planned(eligible_schemes, &compress_ctx, exec_ctx, |opts, _| {
-                Ok(ArrayAndStats::new(array.clone(), opts))
-            })?;
-        self.choose_prepared(
-            data,
-            eligible_schemes,
-            before_nbytes,
-            compress_ctx.with_merged_stats_options(merged_opts),
-            planned,
-            exec_ctx,
-        )
+        self.compress_planned(eligible_schemes, &compress_ctx, exec_ctx, |opts, _| {
+            Ok((ArrayAndStats::new(array.clone(), opts), before_nbytes))
+        })
     }
 
-    /// Builds a site's statistics and candidates for its plan decision. A replayed winner must
-    /// still admit the array by its own estimate, without sampling: `SequenceScheme`, for one,
-    /// fails in `compress` on a chunk with nulls or one that is not an exact sequence. A declined
-    /// replay counts as a plan miss, and the array gets a full selection over every eligible
-    /// scheme and their statistics.
-    fn prepare_planned(
+    /// Compresses one site's array under its plan decision. `build` makes the array with the
+    /// given statistics and its size before compression.
+    ///
+    /// A replayed winner must still admit the array by its own estimate, without sampling:
+    /// `SequenceScheme`, for one, fails in `compress` on a chunk with nulls or one that is not an
+    /// exact sequence. A declined replay counts as a plan miss. A replay that fails anyway, by an
+    /// error or a panic in the winner or any of its children, counts as a fallback. Either way the
+    /// array then gets a full selection over every eligible scheme and their statistics.
+    fn compress_planned(
         &self,
         eligible: Vec<&'static dyn Scheme>,
         compress_ctx: &CompressorContext,
         exec_ctx: &mut ExecutionCtx,
-        mut build: impl FnMut(GenerateStatsOptions, &mut ExecutionCtx) -> VortexResult<ArrayAndStats>,
-    ) -> VortexResult<(
-        ArrayAndStats,
-        Vec<&'static dyn Scheme>,
-        Planned,
-        GenerateStatsOptions,
-    )> {
+        mut build: impl FnMut(
+            GenerateStatsOptions,
+            &mut ExecutionCtx,
+        ) -> VortexResult<(ArrayAndStats, u64)>,
+    ) -> VortexResult<ArrayRef> {
         let mut planned = self.plan_lookup(compress_ctx, &eligible);
-        if let Planned::Replay(Some(scheme)) = &planned {
+        if let (Planned::Replay(Some(scheme)), Some(plan)) = (&planned, &self.plan) {
             let scheme = *scheme;
-            let opts = GenerateStatsOptions::default().merge(scheme.stats_options());
-            let data = build(opts, exec_ctx)?;
-            let ctx = compress_ctx.clone().with_merged_stats_options(opts);
-            if self.replay_admits(scheme, &data, ctx, exec_ctx)? {
-                return Ok((data, vec![scheme], planned, opts));
-            }
-            if let Some(plan) = &self.plan {
-                plan.miss();
+            let replay =
+                plan::catch_replay(|| self.replay(scheme, compress_ctx, exec_ctx, &mut build));
+            match replay {
+                Ok(Ok(Some(compressed))) => return Ok(compressed),
+                Ok(Ok(None)) => plan.miss(),
+                Ok(Err(err)) => plan.fallback(scheme.id(), &format!("error: {err}")),
+                Err(panic) => plan.fallback(scheme.id(), &panic),
             }
             planned = Planned::Off;
         }
@@ -396,8 +388,61 @@ impl CascadingCompressor {
             .fold(GenerateStatsOptions::default(), |acc, s| {
                 acc.merge(s.stats_options())
             });
-        let data = build(opts, exec_ctx)?;
-        Ok((data, eligible, planned, opts))
+        let (data, before_nbytes) = build(opts, exec_ctx)?;
+        self.choose_prepared(
+            data,
+            eligible,
+            before_nbytes,
+            compress_ctx.clone().with_merged_stats_options(opts),
+            planned,
+            exec_ctx,
+        )
+    }
+
+    /// Replays `scheme` on the site's array with only its statistics, or `None` if its estimate
+    /// declines the array.
+    fn replay(
+        &self,
+        scheme: &'static dyn Scheme,
+        compress_ctx: &CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+        build: &mut impl FnMut(
+            GenerateStatsOptions,
+            &mut ExecutionCtx,
+        ) -> VortexResult<(ArrayAndStats, u64)>,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let opts = GenerateStatsOptions::default().merge(scheme.stats_options());
+        let (data, before_nbytes) = build(opts, exec_ctx)?;
+        let ctx = compress_ctx.clone().with_merged_stats_options(opts);
+        // Like a full selection, ask no estimate about an empty, all-null or constant array:
+        // `choose_prepared` finishes those before any scheme runs, and estimates assume varying
+        // valid values (FoR's reads `max - min`, which an all-null chunk's stats leave negative).
+        let finished_early = Self::no_valid_values(&data, exec_ctx)?
+            || constant::is_constant_for_compression(&data, exec_ctx)?;
+        if !finished_early && !self.replay_admits(scheme, &data, ctx.clone(), exec_ctx)? {
+            return Ok(None);
+        }
+        self.choose_prepared(
+            data,
+            vec![scheme],
+            before_nbytes,
+            ctx,
+            Planned::Replay(Some(scheme)),
+            exec_ctx,
+        )
+        .map(Some)
+    }
+
+    /// Whether `data` is empty or all null: arrays `choose_prepared` finishes without a scheme.
+    fn no_valid_values(data: &ArrayAndStats, exec_ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+        if data.array().is_empty() {
+            return Ok(true);
+        }
+        Ok(if data.array().is::<Dict>() {
+            data.varbinview_stats(exec_ctx).null_count() as usize == data.array_len()
+        } else {
+            data.array().all_invalid(exec_ctx)?
+        })
     }
 
     /// The plan's decision for this site, or [`Planned::Off`] without a plan.
@@ -425,12 +470,7 @@ impl CascadingCompressor {
         if data.array().is_empty() {
             return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         }
-        let all_invalid = if data.array().is::<Dict>() {
-            data.varbinview_stats(exec_ctx).null_count() as usize == data.array_len()
-        } else {
-            data.array().all_invalid(exec_ctx)?
-        };
-        if all_invalid {
+        if Self::no_valid_values(&data, exec_ctx)? {
             return Ok(ConstantArray::new(
                 Scalar::null(data.array().dtype().clone()),
                 data.array().len(),

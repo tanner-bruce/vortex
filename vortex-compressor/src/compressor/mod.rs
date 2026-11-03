@@ -12,6 +12,7 @@ mod string_capacity;
 mod strings;
 mod structural;
 
+pub use plan::PlanCounts;
 pub use plan::SchemePlan;
 pub use string_capacity::StringDictionaryCapacity;
 pub use string_capacity::StringDictionaryMemoryShape;

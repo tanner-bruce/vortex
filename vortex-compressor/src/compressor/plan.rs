@@ -9,8 +9,14 @@
 //! plus the cascade history at that point, so a replayed winner's own children find their
 //! recorded winners too and the whole cascade is fixed. Sample compression never reads or writes
 //! the plan. Empty, all-null and constant arrays are still detected per array, before the plan.
+//!
+//! A replay that fails, by an error or a panic in the replayed winner's estimate or compress or
+//! in any of its children, falls back to a full selection for that array. Fallbacks are counted
+//! apart from declined replays (misses), with the first message per scheme kept.
 
+use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -39,6 +45,46 @@ thread_local! {
     /// The structural path of the array being compressed on this thread. Compression of one
     /// array runs synchronously on one thread, so a stack is enough.
     static SITE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Replay fallbacks on this thread, to tell which top-level arrays had one.
+    static FALLBACKS: Cell<u64> = const { Cell::new(0) };
+    /// Whether this thread is inside a replay attempt, whose panics are caught and reported once
+    /// per scheme rather than by the panic hook.
+    static IN_REPLAY: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether the array being compressed on this thread is a top-level one (no site pushed).
+pub(super) fn is_top_level() -> bool {
+    SITE.with_borrow(Vec::is_empty)
+}
+
+/// This thread's replay fallback count so far.
+pub(super) fn thread_fallbacks() -> u64 {
+    FALLBACKS.get()
+}
+
+/// Runs `f`, a replay attempt, catching a panic as an error message. While it runs, the panic
+/// hook stays quiet on this thread: the fallback reports the first message per scheme instead.
+pub(super) fn catch_replay<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    static QUIET_HOOK: std::sync::Once = std::sync::Once::new();
+    QUIET_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if IN_REPLAY.get() == 0 {
+                previous(info);
+            }
+        }));
+    });
+    IN_REPLAY.set(IN_REPLAY.get() + 1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    IN_REPLAY.set(IN_REPLAY.get() - 1);
+    result.map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        format!("panic: {message}")
+    })
 }
 
 /// Runs `f` with `index` pushed on this thread's site path.
@@ -92,6 +138,18 @@ pub(super) enum Planned {
     Replay(Option<&'static dyn Scheme>),
 }
 
+/// A plan's counters; see [`SchemePlan::counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct PlanCounts {
+    pub recorded: u64,
+    pub replayed: u64,
+    pub missed: u64,
+    pub fallbacks: u64,
+    pub chunks: u64,
+    pub fallback_chunks: u64,
+}
+
 /// Records one decision per compression site and replays it. Shared by every array compressed
 /// with the compressor that holds it; the first selection to finish at a site wins.
 #[derive(Debug, Default)]
@@ -100,6 +158,10 @@ pub struct SchemePlan {
     recorded: AtomicU64,
     replayed: AtomicU64,
     missed: AtomicU64,
+    fallbacks: AtomicU64,
+    chunks: AtomicU64,
+    fallback_chunks: AtomicU64,
+    first_errors: Mutex<BTreeMap<String, String>>,
 }
 
 impl SchemePlan {
@@ -156,13 +218,51 @@ impl SchemePlan {
         self.missed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Sites recorded, selections replayed, and replays that fell back to a full selection.
-    pub fn counts(&self) -> (u64, u64, u64) {
-        (
-            self.recorded.load(Ordering::Relaxed),
-            self.replayed.load(Ordering::Relaxed),
-            self.missed.load(Ordering::Relaxed),
-        )
+    /// Counts a replay that failed with `message` (an error or a caught panic), which then got a
+    /// full selection. The first message per scheme is kept here and logged once per process.
+    pub(super) fn fallback(&self, scheme: SchemeId, message: &str) {
+        static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        self.replayed.fetch_sub(1, Ordering::Relaxed);
+        self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        FALLBACKS.set(FALLBACKS.get() + 1);
+        let scheme = scheme.to_string();
+        let first_line = message.lines().next().unwrap_or_default();
+        self.first_errors
+            .lock()
+            .entry(scheme.clone())
+            .or_insert_with(|| first_line.to_owned());
+        let mut logged = LOGGED.lock();
+        if !logged.contains(&scheme) {
+            eprintln!("ZY615_REPLAY_FALLBACK scheme={scheme} error={message:?}");
+            logged.push(scheme);
+        }
+    }
+
+    /// Counts one top-level array compressed with this plan, and whether any replay in it fell
+    /// back.
+    pub(super) fn chunk(&self, had_fallback: bool) {
+        self.chunks.fetch_add(1, Ordering::Relaxed);
+        if had_fallback {
+            self.fallback_chunks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Sites recorded, selections replayed, replays declined by the winner's estimate (misses),
+    /// replays that failed and fell back, top-level arrays, and top-level arrays with a fallback.
+    pub fn counts(&self) -> PlanCounts {
+        PlanCounts {
+            recorded: self.recorded.load(Ordering::Relaxed),
+            replayed: self.replayed.load(Ordering::Relaxed),
+            missed: self.missed.load(Ordering::Relaxed),
+            fallbacks: self.fallbacks.load(Ordering::Relaxed),
+            chunks: self.chunks.load(Ordering::Relaxed),
+            fallback_chunks: self.fallback_chunks.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The first fallback message per scheme, by scheme id.
+    pub fn first_errors(&self) -> BTreeMap<String, String> {
+        self.first_errors.lock().clone()
     }
 
     /// One line per recorded site, `site-path | cascade | decision`, sorted.
