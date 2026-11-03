@@ -50,6 +50,8 @@ use crate::optimizer::ArrayOptimizer;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 use crate::stats::StatsSetRef;
+#[cfg(any(test, feature = "_test-harness"))]
+use crate::test_harness::stats_probe;
 use crate::validity::Validity;
 
 /// A depth-first pre-order iterator over an Array.
@@ -659,6 +661,8 @@ impl ArrayRef {
     }
 
     pub(crate) fn execute_encoding(self, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        #[cfg(any(test, feature = "_test-harness"))]
+        stats_probe::record(stats_probe::StatsProbeKind::ExecuteEncoding, "", &self);
         let inner = Arc::as_ptr(&self.0);
         // SAFETY: the Arc outlives the DynArrayData function call
         unsafe { (&*inner).data.execute(self, ctx) }
@@ -673,6 +677,8 @@ impl ArrayRef {
         self,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ExecutionResult> {
+        #[cfg(any(test, feature = "_test-harness"))]
+        stats_probe::record(stats_probe::StatsProbeKind::ExecuteEncoding, "", &self);
         let inner = Arc::as_ptr(&self.0);
         // SAFETY: `inner` points at the allocation owned by `self.0`. `self` stays alive for the
         // duration of the call, so the pointee remains valid. Avoiding an extra `Arc` clone here

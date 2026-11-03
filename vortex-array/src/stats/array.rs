@@ -30,6 +30,8 @@ use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
+#[cfg(any(test, feature = "_test-harness"))]
+use crate::test_harness::stats_probe;
 
 /// A shared [`StatsSet`] stored in an array. Can be shared by copies of the array and can also be mutated in place.
 // TODO(adamg): This is a very bad name.
@@ -161,6 +163,12 @@ impl StatsSetRef<'_> {
         if let Precision::Exact(s) = self.get(stat) {
             return Ok(Some(s));
         }
+        #[cfg(any(test, feature = "_test-harness"))]
+        stats_probe::record(
+            stats_probe::StatsProbeKind::ComputeStat,
+            stat,
+            self.dyn_array_ref,
+        );
 
         Ok(match stat {
             Stat::Min => min_max(self.dyn_array_ref, ctx, NumericalAggregateOpts::default())?

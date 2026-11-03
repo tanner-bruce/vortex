@@ -12,6 +12,7 @@ use crate::ExecutionCtx;
 use crate::arrays::BoolArray;
 use crate::arrays::bool::BoolArrayExt;
 
+pub mod stats_probe;
 #[cfg(not(codspeed))]
 pub mod trace;
 

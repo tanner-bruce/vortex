@@ -19,6 +19,8 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
+#[cfg(any(test, feature = "_test-harness"))]
+use crate::test_harness::stats_probe;
 
 /// Reference-counted type-erased accumulator.
 pub type AccumulatorRef = Box<dyn DynAccumulator>;
@@ -111,6 +113,12 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         if self.is_saturated() {
             return Ok(());
         }
+        #[cfg(any(test, feature = "_test-harness"))]
+        stats_probe::record(
+            stats_probe::StatsProbeKind::Accumulate,
+            &self.aggregate_fn,
+            batch,
+        );
 
         vortex_ensure!(
             batch.dtype() == &self.dtype,

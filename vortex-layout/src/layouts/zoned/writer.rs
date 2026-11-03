@@ -3,12 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use parking_lot::Mutex;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
@@ -43,6 +46,7 @@ use crate::layouts::zoned::aggregate_partials;
 use crate::layouts::zoned::schema::default_bounded_stat_max_bytes;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
+use crate::sequence::SequenceId;
 use crate::sequence::SequencePointer;
 use crate::sequence::SequentialArrayStreamExt;
 use crate::sequence::SequentialStreamAdapter;
@@ -80,6 +84,52 @@ pub struct ZonedStrategy {
     stats: Arc<dyn LayoutStrategy>,
     options: ZonedLayoutOptions,
     task_lifetime: Option<Arc<dyn Send + Sync>>,
+    supplied: Option<SuppliedZoneAggregates>,
+}
+
+/// Zone partials the caller computed, one entry per chunk, in stream order.
+///
+/// A caller that already holds each zone's aggregates, such as an encoder that folded them while
+/// it built the chunk, pushes them here before it yields the chunk. A [`ZonedStrategy`] built with
+/// [`with_supplied_aggregates`](ZonedStrategy::with_supplied_aggregates) takes one entry per
+/// chunk instead of computing the partials, so the chunk may arrive already compressed and is
+/// neither decoded nor measured. The partials follow the order of
+/// [`ZonedStrategy::aggregate_fns_for`] and the dtypes of each aggregate's partial state.
+#[derive(Clone, Default)]
+pub struct SuppliedZoneAggregates(Arc<Mutex<VecDeque<SuppliedZone>>>);
+
+struct SuppliedZone {
+    rows: usize,
+    partials: Vec<Scalar>,
+}
+
+impl SuppliedZoneAggregates {
+    /// Supply the partials of the next zone, which has `rows` rows.
+    pub fn push(&self, rows: usize, partials: Vec<Scalar>) {
+        self.0.lock().push_back(SuppliedZone { rows, partials });
+    }
+
+    /// Zones supplied and not yet taken by a write.
+    pub fn pending(&self) -> usize {
+        self.0.lock().len()
+    }
+
+    fn take(&self, rows: usize, aggregates: usize) -> VortexResult<Vec<Scalar>> {
+        let Some(zone) = self.0.lock().pop_front() else {
+            vortex_bail!("a zone of {rows} rows arrived before its supplied aggregates");
+        };
+        vortex_ensure!(
+            zone.rows == rows,
+            "supplied zone aggregates are for {} rows, the zone has {rows}",
+            zone.rows
+        );
+        vortex_ensure!(
+            zone.partials.len() == aggregates,
+            "supplied {} zone partials, the zoned layout records {aggregates}",
+            zone.partials.len()
+        );
+        Ok(zone.partials)
+    }
 }
 
 impl ZonedStrategy {
@@ -94,7 +144,70 @@ impl ZonedStrategy {
             stats: Arc::new(stats),
             options,
             task_lifetime: None,
+            supplied: None,
         }
+    }
+
+    /// Take each zone's partials from `supplied` instead of computing them from the chunk.
+    pub fn with_supplied_aggregates(mut self, supplied: SuppliedZoneAggregates) -> Self {
+        self.supplied = Some(supplied);
+        self
+    }
+
+    /// The aggregates this strategy records for a column of `dtype`, in the order supplied
+    /// partials must follow.
+    pub fn aggregate_fns_for(
+        &self,
+        dtype: &DType,
+        session: &VortexSession,
+    ) -> Arc<[AggregateFnRef]> {
+        let requested_fns = self
+            .options
+            .aggregate_fns
+            .clone()
+            .unwrap_or_else(|| default_zoned_aggregate_fns(dtype, session));
+        AggregateStatsAccumulator::new(dtype, &requested_fns).aggregate_fns()
+    }
+
+    /// Each chunk with its zone partials, taken from the caller or computed on CPU tasks.
+    fn chunks_with_partials(
+        &self,
+        stream: SendableSequentialStream,
+        aggregate_fns: Arc<[AggregateFnRef]>,
+        session: &VortexSession,
+    ) -> BoxStream<'static, VortexResult<(SequenceId, ArrayRef, Vec<Scalar>)>> {
+        if let Some(supplied) = self.supplied.clone() {
+            return stream
+                .map(move |item| {
+                    let (sequence_id, chunk) = item?;
+                    let partials = supplied.take(chunk.len(), aggregate_fns.len())?;
+                    Ok((sequence_id, chunk, partials))
+                })
+                .boxed();
+        }
+        let concurrency = self.options.concurrency.get();
+        let task_lifetime = self.task_lifetime.clone();
+        let compute_session = session.clone();
+        stream
+            .map(move |item| {
+                let aggregate_fns = Arc::clone(&aggregate_fns);
+                let session = compute_session.clone();
+                let task_lifetime = task_lifetime.clone();
+                session.handle().spawn_cpu(move || {
+                    // This guard must survive both normal return and unwinding,
+                    // independently of the strategy and the task's consumer.
+                    let _task_lifetime = task_lifetime;
+                    let (sequence_id, chunk) = item?;
+                    let partials = aggregate_partials(
+                        &chunk,
+                        &aggregate_fns,
+                        &mut session.create_execution_ctx(),
+                    )?;
+                    Ok::<_, VortexError>((sequence_id, chunk, partials))
+                })
+            })
+            .buffered(concurrency)
+            .boxed()
     }
 
     /// Retain an owner while this strategy or any of its statistics tasks is alive.
@@ -124,7 +237,6 @@ impl LayoutStrategy for ZonedStrategy {
             .aggregate_fns
             .clone()
             .unwrap_or_else(|| default_zoned_aggregate_fns(stream.dtype(), session));
-        let compute_session = session.clone();
 
         let stats_accumulator = Arc::new(Mutex::new(AggregateStatsAccumulator::new(
             stream.dtype(),
@@ -157,27 +269,7 @@ impl LayoutStrategy for ZonedStrategy {
         }
 
         let stream_dtype = stream.dtype().clone();
-        let concurrency = self.options.concurrency.get();
-        let task_lifetime = self.task_lifetime.clone();
-        let stream = stream
-            .map(move |item| {
-                let aggregate_fns = Arc::clone(&aggregate_fns);
-                let session = compute_session.clone();
-                let task_lifetime = task_lifetime.clone();
-                session.handle().spawn_cpu(move || {
-                    // This guard must survive both normal return and unwinding,
-                    // independently of the strategy and the task's consumer.
-                    let _task_lifetime = task_lifetime;
-                    let (sequence_id, chunk) = item?;
-                    let partials = aggregate_partials(
-                        &chunk,
-                        &aggregate_fns,
-                        &mut session.create_execution_ctx(),
-                    )?;
-                    Ok::<_, VortexError>((sequence_id, chunk, partials))
-                })
-            })
-            .buffered(concurrency);
+        let stream = self.chunks_with_partials(stream, aggregate_fns, session);
 
         // Accumulate zone stats in stream order so the auxiliary table stays aligned with the
         // data child.
@@ -255,26 +347,7 @@ impl ZonedStrategy {
         aggregate_fns: Arc<[AggregateFnRef]>,
     ) -> VortexResult<LayoutRef> {
         let stream_dtype = stream.dtype().clone();
-        let concurrency = self.options.concurrency.get();
-        let task_lifetime = self.task_lifetime.clone();
-        let compute_session = session.clone();
-        let stream = stream
-            .map(move |item| {
-                let aggregate_fns = Arc::clone(&aggregate_fns);
-                let session = compute_session.clone();
-                let task_lifetime = task_lifetime.clone();
-                session.handle().spawn_cpu(move || {
-                    let _task_lifetime = task_lifetime;
-                    let (sequence_id, chunk) = item?;
-                    let partials = aggregate_partials(
-                        &chunk,
-                        &aggregate_fns,
-                        &mut session.create_execution_ctx(),
-                    )?;
-                    Ok::<_, VortexError>((sequence_id, chunk, partials))
-                })
-            })
-            .buffered(concurrency);
+        let stream = self.chunks_with_partials(stream, aggregate_fns, session);
 
         let partials = Arc::new(Mutex::new(Vec::<Vec<Scalar>>::new()));
         let partials2 = Arc::clone(&partials);
