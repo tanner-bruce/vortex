@@ -68,6 +68,7 @@ pub mod stats;
 
 mod compressor;
 pub use compressor::CascadingCompressor;
+pub use compressor::SchemePlan;
 pub use compressor::StringDictionaryCapacity;
 pub use compressor::StringDictionaryMemoryShape;
 

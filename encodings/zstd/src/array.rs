@@ -29,7 +29,9 @@ use vortex_array::IntoArray;
 use vortex_array::array_slots;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::varbin::VarBinArraySlotsExt as _;
 use vortex_array::arrays::varbinview::build_views::BinaryView;
 use vortex_array::arrays::varbinview::build_views::MAX_BUFFER_LEN;
 use vortex_array::buffer::BufferHandle;
@@ -38,6 +40,7 @@ use vortex_array::builders::VarBinBuilder;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::OffsetBuilderPType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_varbin_builder;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
@@ -444,6 +447,23 @@ impl Zstd {
         )
     }
 
+    /// ZY-615 phase 0 measurement only, never merged: compress a [`VarBinArray`] from its offsets
+    /// and bytes, without building views. The result equals
+    /// [`Self::from_var_bin_view_without_dict`] on the same values.
+    pub fn from_var_bin_without_dict(
+        varbin: &VarBinArray,
+        level: i32,
+        values_per_frame: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ZstdArray> {
+        let validity = varbin.as_ref().validity()?;
+        Self::try_new(
+            varbin.dtype().clone(),
+            ZstdData::from_var_bin_without_dict(varbin, level, values_per_frame, ctx)?,
+            validity,
+        )
+    }
+
     /// Compress a [`PrimitiveArray`] using Zstd.
     pub fn from_primitive(
         parray: &PrimitiveArray,
@@ -602,6 +622,41 @@ fn collect_valid_vbv(
         }
     };
     Ok(buffer_and_value_byte_indices)
+}
+
+/// The length-prefixed valid values of a [`VarBinArray`], as [`collect_valid_vbv`] writes them,
+/// read from the offsets and bytes.
+fn collect_valid_varbin(
+    varbin: &VarBinArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<(ByteBuffer, Vec<usize>)> {
+    let mask = varbin
+        .as_ref()
+        .validity()?
+        .execute_mask(varbin.as_ref().len(), ctx)?;
+    if matches!(mask.bit_buffer(), AllOr::None) {
+        return Ok((Buffer::empty(), Vec::new()));
+    }
+    let offsets = varbin.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+    let bytes = varbin.bytes().as_slice();
+    match_each_integer_ptype!(offsets.ptype(), |O| {
+        let offsets = offsets.as_slice::<O>();
+        let first: usize = offsets[0].as_();
+        let last: usize = offsets[offsets.len() - 1].as_();
+        let mut buffer =
+            BufferMut::with_capacity(last - first + mask.true_count() * size_of::<ViewLen>());
+        let mut value_byte_indices = Vec::with_capacity(mask.true_count());
+        for (i, window) in offsets.windows(2).enumerate() {
+            if !mask.value(i) {
+                continue;
+            }
+            let value = &bytes[window[0].as_()..window[1].as_()];
+            value_byte_indices.push(buffer.len());
+            buffer.extend_trusted(ViewLen::try_from(value.len())?.to_le_bytes().into_iter());
+            buffer.extend_from_slice(value);
+        }
+        Ok((buffer.freeze(), value_byte_indices))
+    })
 }
 
 /// Reconstruct BinaryView structs from length-prefixed byte data.
@@ -1256,6 +1311,46 @@ impl ZstdData {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
         Self::from_var_bin_view_impl(vbv, level, values_per_frame, false, ctx)
+    }
+
+    /// ZY-615 phase 0 measurement only, never merged: the frames of
+    /// [`Self::from_var_bin_view_without_dict`], built from a [`VarBinArray`]'s offsets and
+    /// bytes. Each valid value is copied once, after its length prefix, into the frame input.
+    pub fn from_var_bin_without_dict(
+        varbin: &VarBinArray,
+        level: i32,
+        values_per_frame: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Self> {
+        let (value_bytes, value_byte_indices) = collect_valid_varbin(varbin, ctx)?;
+        let n_values = value_byte_indices.len();
+        let values_per_frame = if values_per_frame > 0 {
+            values_per_frame
+        } else {
+            n_values
+        };
+        let frame_byte_starts = (0..n_values)
+            .step_by(values_per_frame)
+            .map(|i| value_byte_indices[i])
+            .collect::<Vec<_>>();
+        let Frames {
+            dictionary,
+            frames,
+            frame_metas,
+        } = Self::compress_values(
+            &value_bytes,
+            &frame_byte_starts,
+            level,
+            values_per_frame,
+            n_values,
+            false,
+        )?;
+        let metadata = ZstdMetadata {
+            dictionary_size: 0,
+            frames: frame_metas,
+        };
+        debug_assert!(dictionary.is_none());
+        Ok(ZstdData::new(dictionary, frames, metadata, varbin.len()))
     }
 
     fn from_var_bin_view_impl(

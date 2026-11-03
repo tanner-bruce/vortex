@@ -36,6 +36,10 @@ use vortex_error::VortexResult;
 
 use super::CascadingCompressor;
 use super::constant;
+use super::plan::Planned;
+use super::plan::site;
+use super::plan::with_site;
+use super::select::WinnerEstimate;
 use super::strings;
 use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
@@ -128,6 +132,8 @@ impl CascadingCompressor {
                 }
             }
             if supported {
+                let planned = self.plan_lookup(&compress_ctx, &eligible);
+                let eligible = narrow_to_plan(eligible, &planned);
                 let opts = eligible
                     .iter()
                     .fold(GenerateStatsOptions::default(), |opts, s| {
@@ -142,6 +148,7 @@ impl CascadingCompressor {
                     eligible,
                     prepared.packed_nbytes,
                     compress_ctx,
+                    planned,
                     exec_ctx,
                 );
             }
@@ -175,7 +182,10 @@ impl CascadingCompressor {
             Canonical::Struct(struct_array) => {
                 let fields = struct_array
                     .iter_unmasked_fields()
-                    .map(|field| self.compress(field, exec_ctx))
+                    .enumerate()
+                    .map(|(index, field)| {
+                        with_site(index as u32, || self.compress(field, exec_ctx))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 Ok(StructArray::try_new(
@@ -187,10 +197,15 @@ impl CascadingCompressor {
                 .into_array())
             }
             Canonical::Union(union_array) => {
-                let type_ids = self.compress(union_array.type_ids(), exec_ctx)?;
+                let type_ids = with_site(site::UNION_TYPE_IDS, || {
+                    self.compress(union_array.type_ids(), exec_ctx)
+                })?;
                 let children = union_array
                     .iter_children()
-                    .map(|child| self.compress(child, exec_ctx))
+                    .enumerate()
+                    .map(|(index, child)| {
+                        with_site(index as u32, || self.compress(child, exec_ctx))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 Ok(
@@ -208,7 +223,9 @@ impl CascadingCompressor {
             }
             Canonical::Map(map_array) => self.compress_map_array(map_array, compress_ctx, exec_ctx),
             Canonical::FixedSizeList(fsl_array) => {
-                let compressed_elems = self.compress(fsl_array.elements(), exec_ctx)?;
+                let compressed_elems = with_site(site::LIST_ELEMENTS, || {
+                    self.compress(fsl_array.elements(), exec_ctx)
+                })?;
 
                 Ok(FixedSizeListArray::try_new(
                     compressed_elems,
@@ -242,7 +259,9 @@ impl CascadingCompressor {
 
                 // Also compress the underlying storage array. Some extension schemes can beat the
                 // extension storage but still lose to ordinary storage compression.
-                let compressed_storage = self.compress(ext_array.storage_array(), exec_ctx)?;
+                let compressed_storage = with_site(site::EXTENSION_STORAGE, || {
+                    self.compress(ext_array.storage_array(), exec_ctx)
+                })?;
                 let storage_compressed =
                     ExtensionArray::new(ext_array.ext_dtype().clone(), compressed_storage)
                         .into_array();
@@ -254,17 +273,20 @@ impl CascadingCompressor {
                 }
             }
             Canonical::Variant(variant_array) => {
-                let core_storage =
-                    self.compress_physical_slots(variant_array.core_storage(), exec_ctx)?;
+                let core_storage = with_site(site::VARIANT_SLOTS, || {
+                    self.compress_physical_slots(variant_array.core_storage(), exec_ctx)
+                })?;
                 let shredded = variant_array
                     .shredded()
                     .map(|arr| {
-                        // Avoid stack-overflow for variant shredded values
-                        if arr.is::<Variant>() {
-                            self.compress_physical_slots(arr, exec_ctx)
-                        } else {
-                            self.compress(arr, exec_ctx)
-                        }
+                        with_site(site::VARIANT_SLOTS + 1, || {
+                            // Avoid stack-overflow for variant shredded values
+                            if arr.is::<Variant>() {
+                                self.compress_physical_slots(arr, exec_ctx)
+                            } else {
+                                self.compress(arr, exec_ctx)
+                            }
+                        })
                     })
                     .transpose()?;
 
@@ -306,6 +328,10 @@ impl CascadingCompressor {
             && eligible_schemes
                 .iter()
                 .all(|s| s.matches_string_dictionary() == Some(true));
+        // A replayed site keeps the full list's logical-strings choice above, but generates only
+        // the replayed winner's statistics below.
+        let planned = self.plan_lookup(&compress_ctx, &eligible_schemes);
+        let eligible_schemes = narrow_to_plan(eligible_schemes, &planned);
         let before_nbytes = if logical_strings {
             strings::logical_nbytes(&array, exec_ctx)?
         } else {
@@ -323,8 +349,21 @@ impl CascadingCompressor {
             eligible_schemes,
             before_nbytes,
             compress_ctx,
+            planned,
             exec_ctx,
         )
+    }
+
+    /// The plan's decision for this site, or [`Planned::Off`] without a plan.
+    fn plan_lookup(
+        &self,
+        compress_ctx: &CompressorContext,
+        eligible: &[&'static dyn Scheme],
+    ) -> Planned {
+        match &self.plan {
+            Some(plan) => plan.lookup(compress_ctx, eligible),
+            None => Planned::Off,
+        }
     }
 
     /// Selects a scheme over canonical data or a prepared logical string dictionary.
@@ -334,6 +373,7 @@ impl CascadingCompressor {
         eligible_schemes: Vec<&'static dyn Scheme>,
         before_nbytes: u64,
         compress_ctx: CompressorContext,
+        planned: Planned,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         if data.array().is_empty() {
@@ -376,9 +416,26 @@ impl CascadingCompressor {
             return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         }
 
-        let Some((winner, winner_estimate)) =
-            self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
-        else {
+        let chosen = match planned {
+            Planned::Replay(Some(scheme)) => Some((scheme, WinnerEstimate::AlwaysUse)),
+            Planned::Replay(None) => None,
+            Planned::Off => {
+                self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
+            }
+            Planned::Record(key) => {
+                let chosen = self.choose_best_scheme(
+                    &eligible_schemes,
+                    &data,
+                    compress_ctx.clone(),
+                    exec_ctx,
+                )?;
+                if let Some(plan) = &self.plan {
+                    plan.record(key, chosen.map(|(scheme, _)| scheme.id()));
+                }
+                chosen
+            }
+        };
+        let Some((winner, winner_estimate)) = chosen else {
             return self.finish_uncompressed(data, &compress_ctx, exec_ctx);
         };
 
@@ -447,5 +504,18 @@ impl CascadingCompressor {
         } else {
             Ok(data.into_array())
         }
+    }
+}
+
+/// Narrows the eligible schemes to a replayed decision: the winner alone, or none for a site
+/// that stayed canonical.
+fn narrow_to_plan(
+    eligible: Vec<&'static dyn Scheme>,
+    planned: &Planned,
+) -> Vec<&'static dyn Scheme> {
+    match planned {
+        Planned::Replay(Some(scheme)) => vec![*scheme],
+        Planned::Replay(None) => Vec::new(),
+        Planned::Off | Planned::Record(_) => eligible,
     }
 }

@@ -5,14 +5,18 @@
 
 mod cascade;
 mod constant;
+mod plan;
 mod sample;
 mod select;
 mod string_capacity;
 mod strings;
 mod structural;
 
+pub use plan::SchemePlan;
 pub use string_capacity::StringDictionaryCapacity;
 pub use string_capacity::StringDictionaryMemoryShape;
+
+use std::sync::Arc;
 
 use crate::builtins::IntDictScheme;
 use crate::scheme::ChildSelection;
@@ -53,6 +57,10 @@ pub struct CascadingCompressor {
     /// Descendant exclusion rules for the compressor's own cascading (e.g. excluding Dict from
     /// list offsets).
     root_exclusions: Vec<DescendantExclusion>,
+
+    /// ZY-615 phase 0 measurement only: a recorded scheme per compression site, replayed
+    /// instead of selecting again.
+    plan: Option<Arc<SchemePlan>>,
 }
 
 impl CascadingCompressor {
@@ -80,7 +88,15 @@ impl CascadingCompressor {
             schemes,
             string_dictionary_reuse: false,
             root_exclusions,
+            plan: None,
         }
+    }
+
+    /// ZY-615 phase 0 measurement only, never merged: selects a scheme once per compression site
+    /// and replays it for every later array this compressor (or a clone) compresses.
+    pub fn with_scheme_plan(mut self, plan: Arc<SchemePlan>) -> Self {
+        self.plan = Some(plan);
+        self
     }
 
     /// Returns whether the compressor was configured with `scheme`.

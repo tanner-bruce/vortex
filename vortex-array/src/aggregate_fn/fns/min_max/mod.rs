@@ -19,6 +19,7 @@ use self::bool::accumulate_bool;
 use self::decimal::accumulate_decimal;
 use self::extension::accumulate_extension;
 use self::primitive::accumulate_primitive;
+pub use self::varbin::VarBinMinMaxKernel;
 use self::varbin::accumulate_varbinview;
 use crate::ArrayRef;
 use crate::Canonical;
