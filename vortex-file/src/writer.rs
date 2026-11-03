@@ -939,10 +939,10 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
 
     /// Place and write the next range's segments after the ones before it.
     pub async fn push(&mut self, range: RangeWrite) -> VortexResult<()> {
-        if let Some(first) = self.layouts.first() {
-            if range.layout.dtype() != first.layout.dtype() {
-                vortex_bail!("stitched ranges disagree on dtype");
-            }
+        if let Some(first) = self.layouts.first()
+            && range.layout.dtype() != first.layout.dtype()
+        {
+            vortex_bail!("stitched ranges disagree on dtype");
         }
         if range.array_ids != self.array_ids {
             vortex_bail!("a range write interned array encodings the file context lacks");

@@ -2,14 +2,18 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #![expect(clippy::cast_possible_truncation)]
+use std::future::ready;
 use std::iter;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::oneshot;
 use futures::pin_mut;
 use rstest::rstest;
 use vortex_array::ArrayRef;
@@ -1634,15 +1638,54 @@ async fn test_writer_buffered_bytes(
     let mut buf = ByteBufferMut::empty();
     let options = SESSION.write_options().with_strategy(Arc::clone(&strategy));
     let buffered_bytes = options.buffered_bytes_tracker();
-    let mut writer = options.writer(&mut buf, array.dtype().clone());
+    let dtype = array.dtype().clone();
+    let mut writer = options.writer(&mut buf, dtype.clone());
 
     assert_eq!(writer.buffered_bytes(), 0);
 
-    // The third push forces two chunks through the capacity-one input channel while keeping the
-    // writer open. Each physical leaf retains two BUFFER_SIZE chunks while peeking for more input.
-    writer.push(array.clone()).await?;
-    writer.push(array.clone()).await?;
-    writer.push(array).await?;
+    // The writer runs on the caller's task, so it moves only while a push or `finish` polls it,
+    // and a push returns as soon as its chunk is in the input channel. So push three chunks as
+    // one stream that then stays open, and keep polling the writer until it waits for a fourth.
+    // Each physical leaf then retains two BUFFER_SIZE chunks while peeking for more input, and
+    // never more on the way there.
+    let (release, released) = oneshot::channel::<()>();
+    let held_open = futures::stream::once(async move {
+        let _ = released.await;
+    })
+    .filter_map(|()| ready(None));
+    let chunks =
+        futures::stream::iter([array.clone(), array.clone(), array].map(Ok)).chain(held_open);
+    let settle = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let buffered = buffered_bytes.buffered_bytes();
+            assert!(
+                buffered <= expected_buffered_bytes,
+                "{buffered} bytes buffered"
+            );
+            if buffered == expected_buffered_bytes {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the writer did not settle: {buffered} bytes buffered"
+            );
+            tokio::task::yield_now().await;
+        }
+        // Settled: more polls change nothing.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            assert_eq!(buffered_bytes.buffered_bytes(), expected_buffered_bytes);
+        }
+        let _ = release.send(());
+    };
+    let (pushed, ()) = futures::join!(
+        writer.push_stream(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            dtype, chunks
+        ))),
+        settle
+    );
+    pushed?;
 
     assert_eq!(writer.buffered_bytes(), expected_buffered_bytes);
 
