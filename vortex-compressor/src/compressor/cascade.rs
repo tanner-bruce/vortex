@@ -365,6 +365,41 @@ impl CascadingCompressor {
         ) -> VortexResult<(ArrayAndStats, u64)>,
     ) -> VortexResult<ArrayRef> {
         let mut planned = self.plan_lookup(compress_ctx, &eligible);
+        if let (Planned::Race(candidates), Some(plan)) = (&planned, &self.plan) {
+            // ZY-615 cells 4: every candidate compresses the array, children included; the
+            // smallest is kept, the earlier candidate on a tie.
+            let mut best: Option<(ArrayRef, usize)> = None;
+            for &(scheme, rank) in candidates {
+                let attempt = plan::catch_replay(|| match scheme {
+                    Some(scheme) => self.replay(scheme, compress_ctx, exec_ctx, &mut build),
+                    None => self
+                        .replay_canonical(compress_ctx, exec_ctx, &mut build)
+                        .map(Some),
+                });
+                let id = scheme.map_or(super::ROOT_SCHEME_ID, |scheme| scheme.id());
+                match attempt {
+                    Ok(Ok(Some(compressed))) => {
+                        plan.race_candidate(Some(true), None);
+                        if best
+                            .as_ref()
+                            .is_none_or(|(kept, _)| compressed.nbytes() < kept.nbytes())
+                        {
+                            best = Some((compressed, rank));
+                        }
+                    }
+                    Ok(Ok(None)) => plan.race_candidate(Some(false), None),
+                    Ok(Err(err)) => {
+                        plan.race_candidate(None, Some((id, &format!("error: {err}"))));
+                    }
+                    Err(panic) => plan.race_candidate(None, Some((id, &panic))),
+                }
+            }
+            plan.race_result(best.as_ref().map(|(_, rank)| *rank));
+            if let Some((compressed, _)) = best {
+                return Ok(compressed);
+            }
+            planned = Planned::Off;
+        }
         if let (Planned::Replay(Some(scheme)), Some(plan)) = (&planned, &self.plan) {
             let scheme = *scheme;
             let replay =
@@ -431,6 +466,29 @@ impl CascadingCompressor {
             exec_ctx,
         )
         .map(Some)
+    }
+
+    /// The site's array left canonical, as a site replayed as canonical leaves it: a race
+    /// candidate.
+    fn replay_canonical(
+        &self,
+        compress_ctx: &CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+        build: &mut impl FnMut(
+            GenerateStatsOptions,
+            &mut ExecutionCtx,
+        ) -> VortexResult<(ArrayAndStats, u64)>,
+    ) -> VortexResult<ArrayRef> {
+        let opts = GenerateStatsOptions::default();
+        let (data, before_nbytes) = build(opts, exec_ctx)?;
+        self.choose_prepared(
+            data,
+            Vec::new(),
+            before_nbytes,
+            compress_ctx.clone().with_merged_stats_options(opts),
+            Planned::Replay(None),
+            exec_ctx,
+        )
     }
 
     /// Whether `data` is empty or all null: arrays `choose_prepared` finishes without a scheme.
@@ -505,7 +563,8 @@ impl CascadingCompressor {
         let chosen = match planned {
             Planned::Replay(Some(scheme)) => Some((scheme, WinnerEstimate::AlwaysUse)),
             Planned::Replay(None) => None,
-            Planned::Off => {
+            // A race that no candidate won selects in full.
+            Planned::Off | Planned::Race(_) => {
                 self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
             }
             Planned::Record(key) => {

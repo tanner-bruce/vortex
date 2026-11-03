@@ -85,6 +85,8 @@ pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::PlanCounts;
 pub use vortex_compressor::SchemePlan;
 pub use seed::PlanVotes;
+pub use seed::scheme_id;
+pub use seed::seed_described;
 pub use seed::SeededSite;
 pub use vortex_compressor::StringDictionaryCapacity;
 pub use vortex_compressor::StringDictionaryMemoryShape;

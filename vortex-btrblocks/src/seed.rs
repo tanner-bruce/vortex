@@ -13,6 +13,10 @@
 //! The plan takes the decision with the most rows at each site, top down: a child site counts
 //! only when its cascade history follows the decisions taken above it. A node this module does
 //! not know votes nowhere below it and is reported.
+//!
+//! ZY-615 cells 4: [`PlanVotes::seed_races`] makes every voted site a race between its top two
+//! decisions, with Zstd added at string sites, and [`seed_described`] seeds one decision from a
+//! line of [`SchemePlan::describe`], as a pin list written offline holds them.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -30,8 +34,13 @@ use vortex_compressor::scheme::SchemeId;
 use crate::ALL_SCHEMES;
 use crate::schemes::temporal::TemporalScheme;
 
-/// The id of the scheme named `name`, among every scheme this build has.
-fn scheme_id(name: &str) -> Option<SchemeId> {
+/// The id of the scheme named `name`, among every scheme this build has, or the compressor's
+/// root cascade step's.
+pub fn scheme_id(name: &str) -> Option<SchemeId> {
+    let root = SchemePlan::list_offsets_step().0;
+    if name == root.to_string() {
+        return Some(root);
+    }
     let gated: &[&dyn Scheme] = &[
         #[cfg(feature = "zstd")]
         &crate::schemes::string::ZstdScheme,
@@ -59,6 +68,8 @@ type Site = (Vec<u32>, Vec<(SchemeId, usize)>);
 #[derive(Debug, Default)]
 pub struct PlanVotes {
     votes: HashMap<Site, HashMap<Option<SchemeId>, u64>>,
+    /// Voted sites whose arrays are strings (`true`) or binary (`false`).
+    strings: HashMap<Site, bool>,
     unknown: BTreeMap<String, u64>,
     chunks: u64,
     rows: u64,
@@ -108,6 +119,31 @@ impl PlanVotes {
         walk.node(dtype, tree, &mut Vec::new(), &mut Vec::new());
     }
 
+    /// Makes every voted site of `plan` a race between its two decisions with the most rows,
+    /// with string or binary Zstd added at a string or binary site when `zstd`. A site `plan`
+    /// already has a decision for keeps it. Returns the race sites made.
+    pub fn seed_races(&self, plan: &SchemePlan, zstd: bool) -> usize {
+        let label = |decision: &Option<SchemeId>| decision.map(|id| id.to_string());
+        let mut made = 0;
+        for (key, votes) in &self.votes {
+            let (site, history) = key;
+            if plan.is_seeded(site, history) {
+                continue;
+            }
+            let mut ranked = votes.iter().collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| label(a.0).cmp(&label(b.0))));
+            let top = ranked.iter().take(2).map(|(decision, _)| **decision).collect::<Vec<_>>();
+            let extra = match self.strings.get(key) {
+                Some(true) if zstd => scheme_id("vortex.string.zstd"),
+                Some(false) if zstd => scheme_id("vortex.binary.zstd"),
+                _ => None,
+            };
+            plan.race(site, history, &top, extra);
+            made += 1;
+        }
+        made
+    }
+
     /// Seeds `plan` with the decision with the most rows at each reachable site and returns the
     /// seeded sites in site order.
     pub fn seed(&self, plan: &SchemePlan) -> Vec<SeededSite> {
@@ -147,6 +183,50 @@ impl PlanVotes {
         }
         seeded
     }
+}
+
+/// Seeds `plan` with one decision written as [`SchemePlan::describe`] writes it: `site` is the
+/// site path (`0/elements`, empty at the column), `history` the cascade (`scheme[child] > ...`,
+/// empty at a site's top) and `decision` a scheme name or `canonical`.
+pub fn seed_described(
+    plan: &SchemePlan,
+    site: &str,
+    history: &str,
+    decision: &str,
+) -> Result<(), String> {
+    let path = site
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| match part {
+            "elements" => Ok(plan_site::LIST_ELEMENTS),
+            "storage" => Ok(plan_site::EXTENSION_STORAGE),
+            "type_ids" => Ok(plan_site::UNION_TYPE_IDS),
+            index => index
+                .parse::<u32>()
+                .map_err(|_| format!("site {site:?}: part {index:?}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let steps = history
+        .split(" > ")
+        .filter(|step| !step.is_empty())
+        .map(|step| {
+            let (name, child) = step
+                .strip_suffix(']')
+                .and_then(|step| step.rsplit_once('['))
+                .ok_or_else(|| format!("history {history:?}: step {step:?}"))?;
+            let id = scheme_id(name).ok_or_else(|| format!("history {history:?}: scheme {name:?}"))?;
+            let child = child
+                .parse::<usize>()
+                .map_err(|_| format!("history {history:?}: child {child:?}"))?;
+            Ok((id, child))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let decision = match decision {
+        "canonical" => None,
+        name => Some(scheme_id(name).ok_or_else(|| format!("decision {name:?}"))?),
+    };
+    plan.seed(&path, &steps, decision);
+    Ok(())
 }
 
 fn describe((site, history): &Site) -> String {
@@ -391,6 +471,11 @@ impl Walk<'_> {
         };
         if children.iter().any(|(position, ..)| *position >= node.nchildren()) {
             return self.unknown(name, dtype);
+        }
+        if let DType::Utf8(_) | DType::Binary(_) = dtype {
+            self.votes
+                .strings
+                .insert((site.to_vec(), history.to_vec()), dtype.is_utf8());
         }
         self.vote(site, history, decision);
         if let Some(id) = decision {

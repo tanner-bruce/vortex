@@ -17,6 +17,11 @@
 //! A seeded plan ([`SchemePlan::seeded`]) records nothing: its decisions come from the input
 //! parts' own encoding trees through [`SchemePlan::seed`], and a site without one gets a full
 //! selection on every array, counted as unseeded.
+//!
+//! ZY-615 cells 4: a seeded plan may also hold race sites ([`SchemePlan::race`]). At a race site
+//! without a seeded decision, every candidate (the inputs' top two decisions there, and Zstd at a
+//! string site) compresses the array, children included, and the smallest result is kept; ties
+//! keep the earlier candidate. A race where no candidate succeeds gets a full selection.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -140,6 +145,15 @@ pub(super) enum Planned {
     Record(PlanKey),
     /// Replay this decision without selecting.
     Replay(Option<&'static dyn Scheme>),
+    /// Compress with each candidate (`None` for canonical) and keep the smallest; the `usize` is
+    /// the candidate's rank: 0 and 1 for the inputs' top two, 2 for the added Zstd.
+    Race(Vec<(Option<&'static dyn Scheme>, usize)>),
+}
+
+/// A race site's candidates: the inputs' top decisions and an added scheme, each with its rank.
+#[derive(Debug, Clone)]
+struct Race {
+    candidates: Vec<(Option<SchemeId>, usize)>,
 }
 
 /// A plan's counters; see [`SchemePlan::counts`].
@@ -153,6 +167,20 @@ pub struct PlanCounts {
     pub chunks: u64,
     pub fallback_chunks: u64,
     pub unseeded: u64,
+    /// Race sites seeded.
+    pub race_sites: u64,
+    /// Lookups that raced.
+    pub raced: u64,
+    /// Candidates compressed by races.
+    pub race_candidates: u64,
+    /// Races won by the inputs' top decision, their second, and the added Zstd.
+    pub race_wins: [u64; 3],
+    /// Race candidates whose estimate declined the array.
+    pub race_declined: u64,
+    /// Race candidates that failed by an error or a panic.
+    pub race_errors: u64,
+    /// Races no candidate won, which then got a full selection.
+    pub race_failed: u64,
 }
 
 /// Records one decision per compression site and replays it. Shared by every array compressed
@@ -169,6 +197,13 @@ pub struct SchemePlan {
     unseeded: AtomicU64,
     first_errors: Mutex<BTreeMap<String, String>>,
     seeded_only: bool,
+    races: Mutex<FxHashMap<PlanKey, Race>>,
+    raced: AtomicU64,
+    race_candidates: AtomicU64,
+    race_wins: [AtomicU64; 3],
+    race_declined: AtomicU64,
+    race_errors: AtomicU64,
+    race_failed: AtomicU64,
 }
 
 impl SchemePlan {
@@ -204,6 +239,48 @@ impl SchemePlan {
         }
     }
 
+    /// Makes the site `site` with cascade `history` a race site, unless it has a seeded
+    /// decision: `top` are the inputs' top decisions there (`None` for canonical), most rows
+    /// first, and `extra` an added candidate, skipped when `top` has it.
+    pub fn race(
+        &self,
+        site: &[u32],
+        history: &[(SchemeId, usize)],
+        top: &[Option<SchemeId>],
+        extra: Option<SchemeId>,
+    ) {
+        let key = PlanKey {
+            site: site.to_vec(),
+            history: history.to_vec(),
+            logical_strings: false,
+        };
+        let mut candidates = top
+            .iter()
+            .take(2)
+            .enumerate()
+            .map(|(rank, decision)| (*decision, rank))
+            .collect::<Vec<_>>();
+        if let Some(extra) = extra
+            && !top.contains(&Some(extra))
+        {
+            candidates.push((Some(extra), 2));
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        self.races.lock().insert(key, Race { candidates });
+    }
+
+    /// Whether the site `site` with cascade `history` has a seeded decision.
+    pub fn is_seeded(&self, site: &[u32], history: &[(SchemeId, usize)]) -> bool {
+        let key = PlanKey {
+            site: site.to_vec(),
+            history: history.to_vec(),
+            logical_strings: false,
+        };
+        self.decisions.lock().contains_key(&key)
+    }
+
     /// Looks up the site described by `ctx` and this thread's site path.
     pub(super) fn lookup(
         &self,
@@ -218,6 +295,28 @@ impl SchemePlan {
             key.logical_strings = false;
         }
         let decision = self.decisions.lock().get(&key).copied();
+        if decision.is_none()
+            && self.seeded_only
+            && let Some(race) = self.races.lock().get(&key)
+        {
+            let candidates = race
+                .candidates
+                .iter()
+                .filter_map(|(decision, rank)| match decision {
+                    None => Some((None, *rank)),
+                    Some(id) => eligible
+                        .iter()
+                        .find(|s| s.id() == *id)
+                        .map(|scheme| (Some(*scheme), *rank)),
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                self.race_failed.fetch_add(1, Ordering::Relaxed);
+                return Planned::Off;
+            }
+            self.raced.fetch_add(1, Ordering::Relaxed);
+            return Planned::Race(candidates);
+        }
         match decision {
             None if self.seeded_only => {
                 self.unseeded.fetch_add(1, Ordering::Relaxed);
@@ -279,6 +378,40 @@ impl SchemePlan {
         }
     }
 
+    /// Counts one race candidate compressed, and how it ended: `Some(true)` compressed,
+    /// `Some(false)` declined by its estimate, `None` failed with `error` (scheme, message).
+    pub(super) fn race_candidate(&self, outcome: Option<bool>, error: Option<(SchemeId, &str)>) {
+        self.race_candidates.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            Some(true) => {}
+            Some(false) => {
+                self.race_declined.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                self.race_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some((scheme, message)) = error {
+                    let first_line = message.lines().next().unwrap_or_default();
+                    self.first_errors
+                        .lock()
+                        .entry(format!("race {scheme}"))
+                        .or_insert_with(|| first_line.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Counts a race won by the candidate of rank `rank`, or one no candidate won.
+    pub(super) fn race_result(&self, rank: Option<usize>) {
+        match rank {
+            Some(rank) => {
+                self.race_wins[rank.min(2)].fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                self.race_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Counts one top-level array compressed with this plan, and whether any replay in it fell
     /// back.
     pub(super) fn chunk(&self, had_fallback: bool) {
@@ -300,6 +433,17 @@ impl SchemePlan {
             chunks: self.chunks.load(Ordering::Relaxed),
             fallback_chunks: self.fallback_chunks.load(Ordering::Relaxed),
             unseeded: self.unseeded.load(Ordering::Relaxed),
+            race_sites: self.races.lock().len() as u64,
+            raced: self.raced.load(Ordering::Relaxed),
+            race_candidates: self.race_candidates.load(Ordering::Relaxed),
+            race_wins: [
+                self.race_wins[0].load(Ordering::Relaxed),
+                self.race_wins[1].load(Ordering::Relaxed),
+                self.race_wins[2].load(Ordering::Relaxed),
+            ],
+            race_declined: self.race_declined.load(Ordering::Relaxed),
+            race_errors: self.race_errors.load(Ordering::Relaxed),
+            race_failed: self.race_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -308,37 +452,15 @@ impl SchemePlan {
         self.first_errors.lock().clone()
     }
 
-    /// One line per recorded site, `site-path | cascade | decision`, sorted.
+    /// One line per recorded site, `site-path | cascade | decision`, and per race site,
+    /// `site-path | cascade | race candidate / candidate / +added`, sorted.
     pub fn describe(&self) -> Vec<String> {
         let mut lines = self
             .decisions
             .lock()
             .iter()
             .map(|(key, decision)| {
-                let mut line = String::new();
-                for (i, index) in key.site.iter().enumerate() {
-                    if i > 0 {
-                        line.push('/');
-                    }
-                    match *index {
-                        site::LIST_ELEMENTS => line.push_str("elements"),
-                        site::EXTENSION_STORAGE => line.push_str("storage"),
-                        site::UNION_TYPE_IDS => line.push_str("type_ids"),
-                        other => {
-                            let _ = write!(line, "{other}");
-                        }
-                    }
-                }
-                line.push_str(" | ");
-                for (i, (id, child)) in key.history.iter().enumerate() {
-                    if i > 0 {
-                        line.push_str(" > ");
-                    }
-                    let _ = write!(line, "{id}[{child}]");
-                }
-                if key.logical_strings {
-                    line.push_str(" (logical strings)");
-                }
+                let mut line = key.describe();
                 match decision {
                     Decision::Canonical => line.push_str(" | canonical"),
                     Decision::Scheme(id) => {
@@ -348,7 +470,55 @@ impl SchemePlan {
                 line
             })
             .collect::<Vec<_>>();
+        lines.extend(self.races.lock().iter().map(|(key, race)| {
+            let mut line = key.describe();
+            line.push_str(" | race");
+            for (i, (decision, rank)) in race.candidates.iter().enumerate() {
+                line.push_str(if i > 0 { " / " } else { " " });
+                if *rank == 2 {
+                    line.push('+');
+                }
+                match decision {
+                    None => line.push_str("canonical"),
+                    Some(id) => {
+                        let _ = write!(line, "{id}");
+                    }
+                }
+            }
+            line
+        }));
         lines.sort();
         lines
+    }
+}
+
+impl PlanKey {
+    /// `site-path | cascade`, with ` (logical strings)` when set.
+    fn describe(&self) -> String {
+        let mut line = String::new();
+        for (i, index) in self.site.iter().enumerate() {
+            if i > 0 {
+                line.push('/');
+            }
+            match *index {
+                site::LIST_ELEMENTS => line.push_str("elements"),
+                site::EXTENSION_STORAGE => line.push_str("storage"),
+                site::UNION_TYPE_IDS => line.push_str("type_ids"),
+                other => {
+                    let _ = write!(line, "{other}");
+                }
+            }
+        }
+        line.push_str(" | ");
+        for (i, (id, child)) in self.history.iter().enumerate() {
+            if i > 0 {
+                line.push_str(" > ");
+            }
+            let _ = write!(line, "{id}[{child}]");
+        }
+        if self.logical_strings {
+            line.push_str(" (logical strings)");
+        }
+        line
     }
 }
