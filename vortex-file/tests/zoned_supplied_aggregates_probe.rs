@@ -62,6 +62,8 @@ fn count(events: &[&StatsProbeEvent], kind: StatsProbeKind) -> usize {
 
 #[tokio::test]
 async fn the_supplied_path_computes_and_decodes_nothing() -> VortexResult<()> {
+    // Built outside every probe window: building the dtype validates list offsets.
+    struct_dtype();
     // Control: the computed path must show up, or a silent probe proves nothing.
     stats_probe::start();
     write_computed().await?;

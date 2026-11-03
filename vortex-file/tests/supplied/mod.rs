@@ -378,10 +378,16 @@ pub fn options(strategy: Arc<dyn LayoutStrategy>) -> vortex_file::VortexWriteOpt
         .with_file_statistics(Vec::new())
 }
 
-fn struct_dtype() -> DType {
+/// The file's struct dtype. Building it from arrays runs the list offsets' validation, which
+/// computes statistics, so a probing test forces it before it starts the probe.
+static STRUCT_DTYPE: LazyLock<DType> = LazyLock::new(|| {
     zone_struct(zone_columns(ZONES - 1), LAST_ZONE_LEN)
         .dtype()
         .clone()
+});
+
+pub fn struct_dtype() -> DType {
+    STRUCT_DTYPE.clone()
 }
 
 fn computed_stream(zones: std::ops::Range<usize>) -> impl vortex_array::stream::ArrayStream {

@@ -395,12 +395,9 @@ async fn write_with_supplied(
 ) -> VortexResult<ByteBuffer> {
     let supplied = new_supplied();
     let prepared = prepare_zones(0..ZONES)?;
-    let dtype = zone_struct(zone_columns(ZONES - 1), LAST_ZONE_LEN)
-        .dtype()
-        .clone();
     let handles = supplied.clone();
     let stream = ArrayStreamAdapter::new(
-        dtype,
+        struct_dtype(),
         futures::stream::iter(prepared).map(move |zone| Ok(supply(&handles, zone))),
     );
     let mut bytes = Vec::new();
