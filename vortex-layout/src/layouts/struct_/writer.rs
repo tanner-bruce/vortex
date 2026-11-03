@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use futures::future::try_join;
+use futures::future::join;
 use futures::future::try_join_all;
 use futures::pin_mut;
 use itertools::Itertools;
@@ -247,7 +247,11 @@ impl LayoutStrategy for StructStrategy {
             })
             .collect();
 
-        let (_success, column_layouts) = try_join(fanout_fut, try_join_all(layout_futures)).await?;
+        // A failed column writer drops its receiver, so the fan-out only sees that the writer
+        // stopped: report the writer's own error ahead of the fan-out's.
+        let (fanout, column_layouts) = join(fanout_fut, try_join_all(layout_futures)).await;
+        let column_layouts = column_layouts?;
+        fanout?;
         // TODO(os): transposed stream could count row counts as well,
         // This must hold though, all columns must have the same row count of the struct layout
         let row_count = column_layouts.first().map(|l| l.row_count()).unwrap_or(0);

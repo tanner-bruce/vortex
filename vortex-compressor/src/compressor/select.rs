@@ -158,6 +158,29 @@ impl CascadingCompressor {
         Ok(best.map(|(scheme, score)| (scheme, WinnerEstimate::Score(score))))
     }
 
+    /// Whether a replayed `scheme` admits `data` by its own estimate, without sampling: a sample
+    /// estimate admits, a skip verdict declines, and a callback (such as `SequenceScheme`'s
+    /// feasibility check) runs with no threshold.
+    pub(super) fn replay_admits(
+        &self,
+        scheme: &'static dyn Scheme,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool> {
+        Ok(
+            match scheme.expected_compression_ratio(data, compress_ctx.clone(), exec_ctx) {
+                CompressionEstimate::Verdict(EstimateVerdict::Skip) => false,
+                CompressionEstimate::Verdict(_)
+                | CompressionEstimate::Deferred(DeferredEstimate::Sample) => true,
+                CompressionEstimate::Deferred(DeferredEstimate::Callback(callback)) => !matches!(
+                    callback(self, data, None, compress_ctx, exec_ctx)?,
+                    EstimateVerdict::Skip
+                ),
+            },
+        )
+    }
+
     // TODO(connor): Lots of room for optimization here.
     /// Returns `true` if the candidate scheme should be excluded based on the cascade history and
     /// exclusion rules.

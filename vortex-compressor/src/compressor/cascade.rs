@@ -132,22 +132,25 @@ impl CascadingCompressor {
                 }
             }
             if supported {
-                let planned = self.plan_lookup(&compress_ctx, &eligible);
-                let eligible = narrow_to_plan(eligible, &planned);
-                let opts = eligible
-                    .iter()
-                    .fold(GenerateStatsOptions::default(), |opts, s| {
-                        opts.merge(s.stats_options())
-                    });
-                let prepared = strings::analyze_dictionary(&dict.into_owned(), opts, exec_ctx)?;
-                let data = ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
-                let mut compress_ctx = compress_ctx.with_merged_stats_options(opts);
+                let dict = dict.into_owned();
+                let mut compress_ctx = compress_ctx;
                 compress_ctx.logical_strings = true;
+                let mut packed_nbytes = 0;
+                let (data, eligible, planned, opts) =
+                    self.prepare_planned(eligible, &compress_ctx, exec_ctx, |opts, exec_ctx| {
+                        let prepared = strings::analyze_dictionary(&dict, opts, exec_ctx)?;
+                        packed_nbytes = prepared.packed_nbytes;
+                        Ok(ArrayAndStats::new_dictionary(
+                            prepared.array,
+                            opts,
+                            prepared.stats,
+                        ))
+                    })?;
                 return self.choose_prepared(
                     data,
                     eligible,
-                    prepared.packed_nbytes,
-                    compress_ctx,
+                    packed_nbytes,
+                    compress_ctx.with_merged_stats_options(opts),
                     planned,
                     exec_ctx,
                 );
@@ -328,30 +331,73 @@ impl CascadingCompressor {
             && eligible_schemes
                 .iter()
                 .all(|s| s.matches_string_dictionary() == Some(true));
-        // A replayed site keeps the full list's logical-strings choice above, but generates only
-        // the replayed winner's statistics below.
-        let planned = self.plan_lookup(&compress_ctx, &eligible_schemes);
-        let eligible_schemes = narrow_to_plan(eligible_schemes, &planned);
         let before_nbytes = if logical_strings {
             strings::logical_nbytes(&array, exec_ctx)?
         } else {
             array.nbytes()
         };
-        let merged_opts = eligible_schemes
+        let mut compress_ctx = compress_ctx;
+        compress_ctx.logical_strings = logical_strings;
+        // A replayed site keeps the full list's logical-strings choice above, but generates only
+        // the replayed winner's statistics.
+        let (data, eligible_schemes, planned, merged_opts) =
+            self.prepare_planned(eligible_schemes, &compress_ctx, exec_ctx, |opts, _| {
+                Ok(ArrayAndStats::new(array.clone(), opts))
+            })?;
+        self.choose_prepared(
+            data,
+            eligible_schemes,
+            before_nbytes,
+            compress_ctx.with_merged_stats_options(merged_opts),
+            planned,
+            exec_ctx,
+        )
+    }
+
+    /// Builds a site's statistics and candidates for its plan decision. A replayed winner must
+    /// still admit the array by its own estimate, without sampling: `SequenceScheme`, for one,
+    /// fails in `compress` on a chunk with nulls or one that is not an exact sequence. A declined
+    /// replay counts as a plan miss, and the array gets a full selection over every eligible
+    /// scheme and their statistics.
+    fn prepare_planned(
+        &self,
+        eligible: Vec<&'static dyn Scheme>,
+        compress_ctx: &CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+        mut build: impl FnMut(GenerateStatsOptions, &mut ExecutionCtx) -> VortexResult<ArrayAndStats>,
+    ) -> VortexResult<(
+        ArrayAndStats,
+        Vec<&'static dyn Scheme>,
+        Planned,
+        GenerateStatsOptions,
+    )> {
+        let mut planned = self.plan_lookup(compress_ctx, &eligible);
+        if let Planned::Replay(Some(scheme)) = &planned {
+            let scheme = *scheme;
+            let opts = GenerateStatsOptions::default().merge(scheme.stats_options());
+            let data = build(opts, exec_ctx)?;
+            let ctx = compress_ctx.clone().with_merged_stats_options(opts);
+            if self.replay_admits(scheme, &data, ctx, exec_ctx)? {
+                return Ok((data, vec![scheme], planned, opts));
+            }
+            if let Some(plan) = &self.plan {
+                plan.miss();
+            }
+            planned = Planned::Off;
+        }
+        // A site replayed as canonical has no candidates.
+        let eligible = if matches!(planned, Planned::Replay(None)) {
+            Vec::new()
+        } else {
+            eligible
+        };
+        let opts = eligible
             .iter()
             .fold(GenerateStatsOptions::default(), |acc, s| {
                 acc.merge(s.stats_options())
             });
-        let mut compress_ctx = compress_ctx.with_merged_stats_options(merged_opts);
-        compress_ctx.logical_strings = logical_strings;
-        self.choose_prepared(
-            ArrayAndStats::new(array, merged_opts),
-            eligible_schemes,
-            before_nbytes,
-            compress_ctx,
-            planned,
-            exec_ctx,
-        )
+        let data = build(opts, exec_ctx)?;
+        Ok((data, eligible, planned, opts))
     }
 
     /// The plan's decision for this site, or [`Planned::Off`] without a plan.
@@ -504,18 +550,5 @@ impl CascadingCompressor {
         } else {
             Ok(data.into_array())
         }
-    }
-}
-
-/// Narrows the eligible schemes to a replayed decision: the winner alone, or none for a site
-/// that stayed canonical.
-fn narrow_to_plan(
-    eligible: Vec<&'static dyn Scheme>,
-    planned: &Planned,
-) -> Vec<&'static dyn Scheme> {
-    match planned {
-        Planned::Replay(Some(scheme)) => vec![*scheme],
-        Planned::Replay(None) => Vec::new(),
-        Planned::Off | Planned::Record(_) => eligible,
     }
 }

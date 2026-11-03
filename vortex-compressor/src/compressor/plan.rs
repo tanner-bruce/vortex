@@ -150,6 +150,12 @@ impl SchemePlan {
         }
     }
 
+    /// Counts a replay whose winner declined the array, which then got a full selection.
+    pub(super) fn miss(&self) {
+        self.replayed.fetch_sub(1, Ordering::Relaxed);
+        self.missed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sites recorded, selections replayed, and replays that fell back to a full selection.
     pub fn counts(&self) -> (u64, u64, u64) {
         (
