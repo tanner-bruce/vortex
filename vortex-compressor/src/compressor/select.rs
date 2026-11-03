@@ -159,8 +159,9 @@ impl CascadingCompressor {
     }
 
     /// Whether a replayed `scheme` admits `data` by its own estimate, without sampling: a sample
-    /// estimate admits, a skip verdict declines, and a callback (such as `SequenceScheme`'s
-    /// feasibility check) runs with no threshold.
+    /// estimate admits, a skip verdict or a ratio a full selection would not accept (such as
+    /// FoR's 1.0 on a signed range that wraps) declines, and a callback (such as
+    /// `SequenceScheme`'s feasibility check) runs with no threshold.
     pub(super) fn replay_admits(
         &self,
         scheme: &'static dyn Scheme,
@@ -168,17 +169,19 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
-        Ok(
-            match scheme.expected_compression_ratio(data, compress_ctx.clone(), exec_ctx) {
-                CompressionEstimate::Verdict(EstimateVerdict::Skip) => false,
-                CompressionEstimate::Verdict(_)
-                | CompressionEstimate::Deferred(DeferredEstimate::Sample) => true,
-                CompressionEstimate::Deferred(DeferredEstimate::Callback(callback)) => !matches!(
-                    callback(self, data, None, compress_ctx, exec_ctx)?,
-                    EstimateVerdict::Skip
-                ),
-            },
-        )
+        let verdict = match scheme.expected_compression_ratio(data, compress_ctx.clone(), exec_ctx)
+        {
+            CompressionEstimate::Verdict(verdict) => verdict,
+            CompressionEstimate::Deferred(DeferredEstimate::Sample) => return Ok(true),
+            CompressionEstimate::Deferred(DeferredEstimate::Callback(callback)) => {
+                callback(self, data, None, compress_ctx, exec_ctx)?
+            }
+        };
+        Ok(match verdict {
+            EstimateVerdict::Skip => false,
+            EstimateVerdict::AlwaysUse => true,
+            EstimateVerdict::Ratio(ratio) => EstimateScore::FiniteCompression(ratio).is_valid(),
+        })
     }
 
     // TODO(connor): Lots of room for optimization here.
