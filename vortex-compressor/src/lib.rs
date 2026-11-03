@@ -70,6 +70,7 @@ mod compressor;
 pub use compressor::CascadingCompressor;
 pub use compressor::PlanCounts;
 pub use compressor::SchemePlan;
+pub use compressor::plan_site;
 pub use compressor::StringDictionaryCapacity;
 pub use compressor::StringDictionaryMemoryShape;
 

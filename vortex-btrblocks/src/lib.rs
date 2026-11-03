@@ -70,6 +70,7 @@ mod builder;
 mod canonical_compressor;
 /// Compression scheme implementations.
 pub mod schemes;
+mod seed;
 #[cfg(test)]
 #[cfg(not(codspeed))]
 mod trace_tests;
@@ -83,6 +84,8 @@ pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::PlanCounts;
 pub use vortex_compressor::SchemePlan;
+pub use seed::PlanVotes;
+pub use seed::SeededSite;
 pub use vortex_compressor::StringDictionaryCapacity;
 pub use vortex_compressor::StringDictionaryMemoryShape;
 pub use vortex_compressor::scheme::CompressorContext;

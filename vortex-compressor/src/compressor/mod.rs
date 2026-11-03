@@ -14,6 +14,7 @@ mod structural;
 
 pub use plan::PlanCounts;
 pub use plan::SchemePlan;
+pub use plan::site as plan_site;
 pub use string_capacity::StringDictionaryCapacity;
 pub use string_capacity::StringDictionaryMemoryShape;
 

@@ -13,6 +13,10 @@
 //! A replay that fails, by an error or a panic in the replayed winner's estimate or compress or
 //! in any of its children, falls back to a full selection for that array. Fallbacks are counted
 //! apart from declined replays (misses), with the first message per scheme kept.
+//!
+//! A seeded plan ([`SchemePlan::seeded`]) records nothing: its decisions come from the input
+//! parts' own encoding trees through [`SchemePlan::seed`], and a site without one gets a full
+//! selection on every array, counted as unseeded.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -30,7 +34,7 @@ use crate::scheme::SchemeExt;
 use crate::scheme::SchemeId;
 
 /// Structural child markers for the site path; struct fields and union children use their index.
-pub(super) mod site {
+pub mod site {
     /// The elements of a list, list view or fixed-size list.
     pub const LIST_ELEMENTS: u32 = u32::MAX;
     /// The storage of an extension array.
@@ -148,6 +152,7 @@ pub struct PlanCounts {
     pub fallbacks: u64,
     pub chunks: u64,
     pub fallback_chunks: u64,
+    pub unseeded: u64,
 }
 
 /// Records one decision per compression site and replays it. Shared by every array compressed
@@ -161,13 +166,42 @@ pub struct SchemePlan {
     fallbacks: AtomicU64,
     chunks: AtomicU64,
     fallback_chunks: AtomicU64,
+    unseeded: AtomicU64,
     first_errors: Mutex<BTreeMap<String, String>>,
+    seeded_only: bool,
 }
 
 impl SchemePlan {
     /// An empty plan.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty plan that only replays what [`SchemePlan::seed`] gives it.
+    pub fn seeded() -> Self {
+        Self {
+            seeded_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// The cascade step of a list's offsets below the list's own site and history.
+    pub fn list_offsets_step() -> (SchemeId, usize) {
+        (super::ROOT_SCHEME_ID, super::structural::LIST_OFFSETS_CHILD)
+    }
+
+    /// Seeds `decision` (`None` for canonical) at the site `site` with cascade `history`. A
+    /// seeded site matches either logical-strings choice.
+    pub fn seed(&self, site: &[u32], history: &[(SchemeId, usize)], decision: Option<SchemeId>) {
+        let key = PlanKey {
+            site: site.to_vec(),
+            history: history.to_vec(),
+            logical_strings: false,
+        };
+        let decision = decision.map_or(Decision::Canonical, Decision::Scheme);
+        if self.decisions.lock().insert(key, decision).is_none() {
+            self.recorded.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Looks up the site described by `ctx` and this thread's site path.
@@ -179,9 +213,16 @@ impl SchemePlan {
         if ctx.is_sample() {
             return Planned::Off;
         }
-        let key = PlanKey::new(ctx);
+        let mut key = PlanKey::new(ctx);
+        if self.seeded_only {
+            key.logical_strings = false;
+        }
         let decision = self.decisions.lock().get(&key).copied();
         match decision {
+            None if self.seeded_only => {
+                self.unseeded.fetch_add(1, Ordering::Relaxed);
+                Planned::Off
+            }
             None => Planned::Record(key),
             Some(Decision::Canonical) => {
                 self.replayed.fetch_add(1, Ordering::Relaxed);
@@ -247,8 +288,9 @@ impl SchemePlan {
         }
     }
 
-    /// Sites recorded, selections replayed, replays declined by the winner's estimate (misses),
-    /// replays that failed and fell back, top-level arrays, and top-level arrays with a fallback.
+    /// Sites recorded or seeded, selections replayed, replays declined by the winner's estimate
+    /// (misses), replays that failed and fell back, top-level arrays, top-level arrays with a
+    /// fallback, and lookups a seeded plan had no decision for.
     pub fn counts(&self) -> PlanCounts {
         PlanCounts {
             recorded: self.recorded.load(Ordering::Relaxed),
@@ -257,6 +299,7 @@ impl SchemePlan {
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
             chunks: self.chunks.load(Ordering::Relaxed),
             fallback_chunks: self.fallback_chunks.load(Ordering::Relaxed),
+            unseeded: self.unseeded.load(Ordering::Relaxed),
         }
     }
 

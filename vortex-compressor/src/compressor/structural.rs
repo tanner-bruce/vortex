@@ -24,6 +24,9 @@ use super::ROOT_SCHEME_ID;
 use crate::CascadingCompressor;
 use crate::scheme::CompressorContext;
 
+/// The cascade child index of list offsets, for [`super::SchemePlan::list_offsets_step`].
+pub(super) const LIST_OFFSETS_CHILD: usize = root_list_children::OFFSETS;
+
 /// Child indices for the compressor's list/listview compression.
 pub(super) mod root_list_children {
     /// List/ListView offsets child.

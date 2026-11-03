@@ -149,6 +149,8 @@ pub mod compressor {
     pub use vortex_btrblocks::SchemeId;
     pub use vortex_btrblocks::PlanCounts;
     pub use vortex_btrblocks::SchemePlan;
+    pub use vortex_btrblocks::PlanVotes;
+    pub use vortex_btrblocks::SeededSite;
     pub use vortex_btrblocks::StringDictionaryCapacity;
     pub use vortex_btrblocks::StringDictionaryMemoryShape;
 }
