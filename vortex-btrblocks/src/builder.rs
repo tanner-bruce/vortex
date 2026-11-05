@@ -16,6 +16,7 @@ use crate::CompressionSessionExt;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+use crate::SchemePins;
 use crate::allowed_ids::AllowedIds;
 use crate::schemes::binary;
 use crate::schemes::float;
@@ -138,6 +139,7 @@ pub struct BtrBlocksCompressorBuilder {
     allowed: AllowedIds,
     mode: CompressionMode,
     string_dictionary_reuse: bool,
+    pins: Option<&'static SchemePins>,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
@@ -148,6 +150,7 @@ impl Default for BtrBlocksCompressorBuilder {
             allowed: AllowedIds::all(),
             mode: CompressionMode::All,
             string_dictionary_reuse: false,
+            pins: None,
         }
     }
 }
@@ -162,6 +165,7 @@ impl BtrBlocksCompressorBuilder {
             allowed: AllowedIds::from_session(session),
             mode: CompressionMode::Default,
             string_dictionary_reuse: false,
+            pins: None,
         }
     }
 
@@ -175,6 +179,7 @@ impl BtrBlocksCompressorBuilder {
             allowed: AllowedIds::all(),
             mode: CompressionMode::All,
             string_dictionary_reuse: false,
+            pins: None,
         }
     }
 
@@ -246,13 +251,23 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Replays `pins` at the sites they pin instead of searching there; see
+    /// [`CascadingCompressor::with_pins`]. Resolve the table against a compressor built with the
+    /// same schemes.
+    pub fn with_pins(mut self, pins: &'static SchemePins) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`] from the schemes that its preset does not
     /// exclude and whose produced serialized IDs are all allowed.
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(
-            CascadingCompressor::new(self.allowed_schemes())
-                .with_string_dictionary_reuse(self.string_dictionary_reuse),
-        )
+        let compressor = CascadingCompressor::new(self.allowed_schemes())
+            .with_string_dictionary_reuse(self.string_dictionary_reuse);
+        BtrBlocksCompressor(match self.pins {
+            Some(pins) => compressor.with_pins(pins),
+            None => compressor,
+        })
     }
 
     fn allowed_schemes(&self) -> Vec<&'static dyn Scheme> {

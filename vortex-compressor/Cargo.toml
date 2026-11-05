@@ -32,6 +32,11 @@ rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-session = { workspace = true }
 
+[features]
+# Reports each searched site's key and decision, for offline pin generation. Not for production
+# builds.
+site-observer = []
+
 [lints]
 workspace = true
 
