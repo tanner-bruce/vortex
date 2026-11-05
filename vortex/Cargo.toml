@@ -86,6 +86,9 @@ tokio = [
     "vortex-layout/tokio",
 ]
 zstd = ["dep:vortex-zstd", "vortex-file?/zstd"]
+# Reports each searched compression site's key and decision, for offline pin generation. Not
+# for production builds.
+site-observer = ["vortex-btrblocks/site-observer"]
 tensor = ["dep:vortex-tensor", "vortex-file?/tensor"]
 wasm-bindgen = [
     "vortex-file?/wasm-bindgen",

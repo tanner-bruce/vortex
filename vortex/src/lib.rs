@@ -145,10 +145,18 @@ pub mod buffer {
 pub mod compressor {
     pub use vortex_btrblocks::BtrBlocksCompressor;
     pub use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    #[cfg(feature = "site-observer")]
+    pub use vortex_btrblocks::ObservedSite;
+    pub use vortex_btrblocks::PinSpec;
+    pub use vortex_btrblocks::PinTally;
     pub use vortex_btrblocks::Scheme;
     pub use vortex_btrblocks::SchemeId;
+    pub use vortex_btrblocks::SchemePins;
+    pub use vortex_btrblocks::SiteKey;
+    pub use vortex_btrblocks::SitePath;
     pub use vortex_btrblocks::StringDictionaryCapacity;
     pub use vortex_btrblocks::StringDictionaryMemoryShape;
+    pub use vortex_btrblocks::site;
 }
 
 /// Vortex editions: versioned sets of serialized components.

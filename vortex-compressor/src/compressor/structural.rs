@@ -23,6 +23,8 @@ use vortex_error::vortex_err;
 use super::ROOT_SCHEME_ID;
 use crate::CascadingCompressor;
 use crate::scheme::CompressorContext;
+use crate::scheme::SitePath;
+use crate::scheme::site;
 
 /// Child indices for the compressor's list/listview compression.
 pub(super) mod root_list_children {
@@ -42,7 +44,11 @@ impl CascadingCompressor {
     ) -> VortexResult<ArrayRef> {
         let list_array = list_array.reset_offsets(true, exec_ctx)?;
 
-        let compressed_elems = self.compress(list_array.elements(), exec_ctx)?;
+        let compressed_elems = self.compress_at(
+            list_array.elements(),
+            compress_ctx.site().child(site::LIST_ELEMENTS),
+            exec_ctx,
+        )?;
 
         // Record the root scheme with the offsets child index so root exclusion rules apply.
         let offset_ctx =
@@ -72,7 +78,11 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let compressed_elems = self.compress(list_view.elements(), exec_ctx)?;
+        let compressed_elems = self.compress_at(
+            list_view.elements(),
+            compress_ctx.site().child(site::LIST_ELEMENTS),
+            exec_ctx,
+        )?;
 
         let offset_ctx = compress_ctx
             .clone()
@@ -126,18 +136,21 @@ impl CascadingCompressor {
         Ok(MapArray::try_new(data_parts.map_dtype, entries)?.into_array())
     }
 
-    /// Compress very child slot of the array, then re-build it from them.
+    /// Compress very child slot of the array, each at its index below `site`, then re-build it
+    /// from them.
     pub(super) fn compress_physical_slots(
         &self,
         array: &ArrayRef,
+        site: SitePath,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let slots = array
             .slots()
             .iter()
-            .map(|slot| {
+            .enumerate()
+            .map(|(index, slot)| {
                 slot.as_ref()
-                    .map(|child| self.compress(child, exec_ctx))
+                    .map(|child| self.compress_at(child, site.child_index(index), exec_ctx))
                     .transpose()
             })
             .collect::<VortexResult<ArraySlots>>()?;

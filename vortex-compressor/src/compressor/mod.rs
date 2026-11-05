@@ -5,12 +5,18 @@
 
 mod cascade;
 mod constant;
+mod pins;
 mod sample;
 mod select;
 mod string_capacity;
 mod strings;
 mod structural;
 
+#[cfg(feature = "site-observer")]
+pub use pins::ObservedSite;
+pub use pins::PinSpec;
+pub use pins::PinTally;
+pub use pins::SchemePins;
 pub use string_capacity::StringDictionaryCapacity;
 pub use string_capacity::StringDictionaryMemoryShape;
 
@@ -53,6 +59,9 @@ pub struct CascadingCompressor {
     /// Descendant exclusion rules for the compressor's own cascading (e.g. excluding Dict from
     /// list offsets).
     root_exclusions: Vec<DescendantExclusion>,
+
+    /// Pinned decisions per site, replayed instead of searched.
+    pins: Option<&'static SchemePins>,
 }
 
 impl CascadingCompressor {
@@ -80,7 +89,17 @@ impl CascadingCompressor {
             schemes,
             string_dictionary_reuse: false,
             root_exclusions,
+            pins: None,
         }
+    }
+
+    /// Replays `pins` at the sites they pin instead of searching there (see [`SchemePins`]).
+    ///
+    /// The table should be resolved against this compressor's schemes: a pinned scheme this
+    /// compressor does not have is ineligible everywhere, and those sites search.
+    pub fn with_pins(mut self, pins: &'static SchemePins) -> Self {
+        self.pins = Some(pins);
+        self
     }
 
     /// Returns whether the compressor was configured with `scheme`.
@@ -93,5 +112,7 @@ impl CascadingCompressor {
 
 // NB: Cascading compression logic is located in `vortex-compressor/src/compressor/cascade.rs`.
 
+#[cfg(test)]
+mod pins_tests;
 #[cfg(test)]
 mod tests;

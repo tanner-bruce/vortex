@@ -11,6 +11,7 @@ use crate::CascadingCompressor;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+use crate::SchemePins;
 use crate::schemes::binary;
 use crate::schemes::decimal;
 use crate::schemes::float;
@@ -91,6 +92,7 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
     string_dictionary_reuse: bool,
+    pins: Option<&'static SchemePins>,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
@@ -98,6 +100,7 @@ impl Default for BtrBlocksCompressorBuilder {
         Self {
             schemes: ALL_SCHEMES.to_vec(),
             string_dictionary_reuse: false,
+            pins: None,
         }
     }
 }
@@ -110,6 +113,7 @@ impl BtrBlocksCompressorBuilder {
         Self {
             schemes: Vec::new(),
             string_dictionary_reuse: false,
+            pins: None,
         }
     }
 
@@ -219,12 +223,22 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Replays `pins` at the sites they pin instead of searching there; see
+    /// [`CascadingCompressor::with_pins`]. Resolve the table against a compressor built with the
+    /// same schemes.
+    pub fn with_pins(mut self, pins: &'static SchemePins) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(
-            CascadingCompressor::new(self.schemes)
-                .with_string_dictionary_reuse(self.string_dictionary_reuse),
-        )
+        let compressor = CascadingCompressor::new(self.schemes)
+            .with_string_dictionary_reuse(self.string_dictionary_reuse);
+        BtrBlocksCompressor(match self.pins {
+            Some(pins) => compressor.with_pins(pins),
+            None => compressor,
+        })
     }
 }
 

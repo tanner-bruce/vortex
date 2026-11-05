@@ -9,6 +9,7 @@ use vortex_error::VortexExpect;
 
 use crate::compressor::ROOT_SCHEME_ID;
 use crate::scheme::SchemeId;
+use crate::scheme::SitePath;
 use crate::stats::GenerateStatsOptions;
 
 // TODO(connor): Why is this 3??? This doesn't seem smart or adaptive.
@@ -40,6 +41,9 @@ pub struct CompressorContext {
     /// [`descendant_exclusions`]: crate::scheme::Scheme::descendant_exclusions
     /// [`ancestor_exclusions`]: crate::scheme::Scheme::ancestor_exclusions
     cascade_history: Vec<(SchemeId, usize)>,
+
+    /// The structural path from the top-level array to this site.
+    site: SitePath,
 }
 
 impl CompressorContext {
@@ -53,6 +57,7 @@ impl CompressorContext {
             allowed_cascading: MAX_CASCADE,
             merged_stats_options: GenerateStatsOptions::default(),
             cascade_history: Vec::new(),
+            site: SitePath::ROOT,
         }
     }
 }
@@ -78,6 +83,17 @@ impl CompressorContext {
     /// Returns the cascade chain of `(scheme_id, child_index)` pairs.
     pub fn cascade_history(&self) -> &[(SchemeId, usize)] {
         &self.cascade_history
+    }
+
+    /// Returns the structural path from the top-level array to this site.
+    pub fn site(&self) -> SitePath {
+        self.site
+    }
+
+    /// Returns a context at the structural site `site`.
+    pub(crate) fn with_site(mut self, site: SitePath) -> Self {
+        self.site = site;
+        self
     }
 
     /// Returns a display wrapper for the current cascade ancestry.

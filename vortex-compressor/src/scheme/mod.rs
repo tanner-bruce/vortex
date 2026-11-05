@@ -10,6 +10,12 @@ pub use ctx::MAX_CASCADE;
 
 pub(crate) mod estimate;
 mod exclusion;
+mod site_path;
+pub use site_path::MAX_SITE_DEPTH;
+pub use site_path::ROOT_SCHEME_NAME;
+pub use site_path::SiteKey;
+pub use site_path::SitePath;
+pub use site_path::site;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;

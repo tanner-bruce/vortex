@@ -68,6 +68,8 @@
 
 mod builder;
 mod canonical_compressor;
+#[cfg(test)]
+mod pins_tests;
 /// Compression scheme implementations.
 pub mod schemes;
 #[cfg(test)]
@@ -81,6 +83,11 @@ pub use builder::BtrBlocksCompressorBuilder;
 pub use canonical_compressor::BtrBlocksCompressor;
 pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
+#[cfg(feature = "site-observer")]
+pub use vortex_compressor::ObservedSite;
+pub use vortex_compressor::PinSpec;
+pub use vortex_compressor::PinTally;
+pub use vortex_compressor::SchemePins;
 pub use vortex_compressor::StringDictionaryCapacity;
 pub use vortex_compressor::StringDictionaryMemoryShape;
 pub use vortex_compressor::scheme::CompressorContext;
@@ -88,6 +95,9 @@ pub use vortex_compressor::scheme::MAX_CASCADE;
 pub use vortex_compressor::scheme::Scheme;
 pub use vortex_compressor::scheme::SchemeExt;
 pub use vortex_compressor::scheme::SchemeId;
+pub use vortex_compressor::scheme::SiteKey;
+pub use vortex_compressor::scheme::SitePath;
+pub use vortex_compressor::scheme::site;
 pub use vortex_compressor::stats::ArrayAndStats;
 pub use vortex_compressor::stats::BoolStats;
 pub use vortex_compressor::stats::FloatStats;
