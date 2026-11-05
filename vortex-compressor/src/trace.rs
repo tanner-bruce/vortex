@@ -194,3 +194,20 @@ pub(super) fn sample_compress_failed(
         );
     }
 }
+
+/// Emits a pinned-scheme failure event; the site's array is then searched.
+#[inline]
+pub(super) fn pin_replay_failed(
+    scheme: SchemeId,
+    ctx: &CompressorContext,
+    err: &impl fmt::Display,
+) {
+    tracing::debug!(
+        target: TARGET_TRACE,
+        scheme = %scheme,
+        site = %ctx.site(),
+        cascade_path = %ctx.cascade_path(),
+        error = %err,
+        "pin.replay_failed",
+    );
+}

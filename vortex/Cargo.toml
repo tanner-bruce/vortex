@@ -89,6 +89,9 @@ zstd = ["dep:vortex-zstd", "vortex-file?/zstd"]
 # wasm32-unknown-unknown.
 parquet-variant = ["dep:vortex-parquet-variant"]
 tensor = ["vortex-file?/tensor"]
+# Reports each searched compression site's key and decision, for offline pin generation. Not
+# for production builds.
+site-observer = ["vortex-btrblocks/site-observer"]
 wasm-bindgen = [
     "vortex-file?/wasm-bindgen",
     "vortex-io/wasm-bindgen",
