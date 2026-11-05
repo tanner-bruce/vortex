@@ -48,6 +48,7 @@ pub struct PinSpec<'a> {
 /// Sites are fixed-size keys in a sorted array, so a lookup allocates nothing.
 #[derive(Debug)]
 pub struct SchemePins {
+    /// Sorted by key; `None` pins canonical.
     sites: Box<[(SiteKey, Option<&'static dyn Scheme>)]>,
 }
 
@@ -150,6 +151,7 @@ pub struct PinTally {
 }
 
 impl PinTally {
+    /// No lookups, for the thread's running tally.
     const ZERO: Self = Self {
         pinned: 0,
         searched: 0,
@@ -173,9 +175,13 @@ impl PinTally {
 /// The outcome of one counted lookup.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Lookup {
+    /// Compressed with the pinned decision.
     Pinned,
+    /// No pin; searched.
     Searched,
+    /// The pinned scheme declined; searched.
     Declined,
+    /// The pinned scheme is not eligible here; searched.
     Ineligible,
 }
 
