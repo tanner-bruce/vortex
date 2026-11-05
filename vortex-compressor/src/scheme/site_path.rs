@@ -39,7 +39,9 @@ const OVERFLOWED: u8 = u8::MAX;
 /// so derived equality and order compare only the path.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SitePath {
+    /// Steps in use; `OVERFLOWED` when the path did not fit.
     len: u8,
+    /// The steps from the top-level array, zero past `len`.
     steps: [u32; MAX_SITE_DEPTH],
 }
 
@@ -131,7 +133,9 @@ impl fmt::Debug for SitePath {
 /// Fixed-size, so a sorted table of keys is searched without allocation.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SiteKey {
+    /// Where the site is in the top-level array.
     path: SitePath,
+    /// Entries of `history` in use.
     history_len: u8,
     /// `(scheme name, child index)` pairs from the top; unused entries stay `("", 0)`.
     history: [(&'static str, u32); MAX_CASCADE],

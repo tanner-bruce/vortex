@@ -31,6 +31,10 @@ use crate::SiteKey;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
 const ROWS: i64 = 4096;
+/// [`ROWS`] as a list's row and offset count.
+const LIST_ROWS: u32 = 4096;
+/// Entries per attribute list.
+const LIST_ENTRIES: u32 = 4;
 
 /// The default schemes, with Zstd for strings when it is built, as zany compacts.
 fn builder() -> BtrBlocksCompressorBuilder {
@@ -45,7 +49,7 @@ fn sequence() -> ArrayRef {
 }
 
 fn runs() -> ArrayRef {
-    PrimitiveArray::from_iter((0..ROWS).map(|i| (i / 64) as i32 * 7)).into_array()
+    PrimitiveArray::from_iter((0..ROWS).map(|i| i / 64 * 7)).into_array()
 }
 
 fn offset_ints() -> ArrayRef {
@@ -78,21 +82,26 @@ fn strings() -> ArrayRef {
 
 /// An attribute-like column: lists of `(key, value)` structs, four entries per row.
 fn attributes() -> VortexResult<ArrayRef> {
-    let entries = ROWS * 4;
+    let entries = LIST_ROWS * LIST_ENTRIES;
     let keys = VarBinViewArray::from_iter_str((0..entries).map(|i| format!("key.{}", i % 6)));
     let values = PrimitiveArray::from_iter((0..entries).map(|i| (i * 7_919) % 300));
     let elements = StructArray::try_new(
         ["key", "value"].into(),
         vec![keys.into_array(), values.into_array()],
-        entries as usize,
+        as_len(entries),
         Validity::NonNullable,
     )?;
     Ok(ListArray::try_new(
         elements.into_array(),
-        PrimitiveArray::from_iter((0..=ROWS).map(|row| (row * 4) as u32)).into_array(),
+        PrimitiveArray::from_iter((0..=LIST_ROWS).map(|row| row * LIST_ENTRIES)).into_array(),
         Validity::NonNullable,
     )?
     .into_array())
+}
+
+/// A count as a length.
+fn as_len(count: u32) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
 }
 
 /// Compresses `input` with `pins` and checks it decodes to `input`.
@@ -186,10 +195,11 @@ fn observed_sites_are_the_lookup_keys() -> VortexResult<()> {
         })
         .collect();
     let tally = replay(&pins, &input)?;
+    assert_eq!(as_len(tally.pinned), observed.len());
     assert_eq!(
         tally,
         PinTally {
-            pinned: u32::try_from(observed.len()).expect("few sites"),
+            pinned: tally.pinned,
             ..PinTally::default()
         }
     );
