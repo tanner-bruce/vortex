@@ -130,6 +130,10 @@ impl FooterSerializer {
     pub(crate) fn serialize_with_metadata(
         mut self,
     ) -> VortexResult<(Segment, super::MetadataSegments, usize)> {
+        #[cfg(feature = "bench-tail")]
+        let mut stamps = SerializerStamps::default();
+        #[cfg(feature = "bench-tail")]
+        let mut lap = bench_tail::Lap::start();
         let mut buffers = Segment::new();
 
         let (metadata_segments, metadata_locators) = if self.metadata.is_empty() {
@@ -161,6 +165,10 @@ impl FooterSerializer {
             (segments, locators)
         };
         let metadata_storage_bytes = buffers.len();
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.metadata_us = lap.lap();
+        }
 
         let dtype_segment = if self.exclude_dtype {
             None
@@ -170,6 +178,10 @@ impl FooterSerializer {
             buffers.push_buffer(buffer);
             Some(dtype_segment)
         };
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.dtype_us = lap.lap();
+        }
 
         // TODO(ngates): we should separate the read/write side of Context since the write side
         //  doesn't need to look anything up in the registry.
@@ -179,7 +191,16 @@ impl FooterSerializer {
             &mut self.offset,
             &self.footer.layout().flatbuffer_writer(&layout_ctx),
         )?;
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.layout_write_us = lap.lap();
+            stamps.layout_bytes = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        }
         verify_readable::<fbl::Layout>(&self.verifier_options, "layout", &buffer)?;
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.layout_verify_us = lap.lap();
+        }
         buffers.push_buffer(buffer);
 
         let statistics_segment = match self.footer.statistics() {
@@ -196,6 +217,10 @@ impl FooterSerializer {
                 Some(stats_segment)
             }
         };
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.statistics_us = lap.lap();
+        }
 
         let (buffer, footer_segment) = write_flatbuffer(
             &mut self.offset,
@@ -205,7 +230,16 @@ impl FooterSerializer {
                 segment_specs: Arc::clone(&self.footer.segments),
             },
         )?;
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.footer_write_us = lap.lap();
+            stamps.footer_bytes = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        }
         verify_readable::<fb::Footer>(&self.verifier_options, "footer", &buffer)?;
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.footer_verify_us = lap.lap();
+        }
         buffers.push_buffer(buffer);
 
         // Assemble the postscript, and write it manually to avoid any framing.
@@ -243,6 +277,11 @@ impl FooterSerializer {
 
         let approx_byte_size = usize::try_from(buffers.len() - metadata_storage_bytes)
             .vortex_expect("the footer fits in memory");
+        #[cfg(feature = "bench-tail")]
+        {
+            stamps.postscript_us = lap.lap();
+            bench_tail::set(stamps);
+        }
         Ok((buffers, metadata_locators.into(), approx_byte_size))
     }
 }
@@ -338,4 +377,83 @@ fn write_buffer(
     out.push_buffer(buffer);
 
     Ok(segment)
+}
+
+/// ZY-184 bet 3 (Lease 6): test-only stamps of where [`FooterSerializer::serialize_with_metadata`]
+/// spent its time, in microseconds, and the sizes of the two large flatbuffers.
+#[cfg(feature = "bench-tail")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SerializerStamps {
+    /// The metadata segments.
+    pub metadata_us: u64,
+    /// The dtype flatbuffer, written and verified.
+    pub dtype_us: u64,
+    /// Writing the layout flatbuffer.
+    pub layout_write_us: u64,
+    /// The layout flatbuffer's bytes.
+    pub layout_bytes: u64,
+    /// Verifying the layout flatbuffer as a reader would.
+    pub layout_verify_us: u64,
+    /// The file statistics flatbuffer, if any.
+    pub statistics_us: u64,
+    /// Writing the footer flatbuffer (the segment specs).
+    pub footer_write_us: u64,
+    /// The footer flatbuffer's bytes.
+    pub footer_bytes: u64,
+    /// Verifying the footer flatbuffer as a reader would.
+    pub footer_verify_us: u64,
+    /// The postscript, its verify, and the EOF.
+    pub postscript_us: u64,
+}
+
+/// ZY-184 bet 3 (Lease 6): the last serializer's stamps on this thread, for the stitched writer
+/// to pick up right after it serialized.
+#[cfg(feature = "bench-tail")]
+pub(crate) mod bench_tail {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    use super::SerializerStamps;
+
+    thread_local! {
+        static LAST: Cell<SerializerStamps> = const { Cell::new(SerializerStamps {
+            metadata_us: 0,
+            dtype_us: 0,
+            layout_write_us: 0,
+            layout_bytes: 0,
+            layout_verify_us: 0,
+            statistics_us: 0,
+            footer_write_us: 0,
+            footer_bytes: 0,
+            footer_verify_us: 0,
+            postscript_us: 0,
+        }) };
+    }
+
+    /// Records the stamps of the serializer that just finished on this thread.
+    pub(crate) fn set(stamps: SerializerStamps) {
+        LAST.with(|cell| cell.set(stamps));
+    }
+
+    /// The stamps of the last serializer on this thread, leaving the default behind.
+    pub(crate) fn take() -> SerializerStamps {
+        LAST.with(Cell::take)
+    }
+
+    /// A stopwatch that hands out the microseconds since its start or its previous lap.
+    pub(crate) struct Lap(Instant);
+
+    impl Lap {
+        pub(crate) fn start() -> Self {
+            Self(Instant::now())
+        }
+
+        /// Microseconds since the previous lap (or the start); the next lap starts now.
+        pub(crate) fn lap(&mut self) -> u64 {
+            let now = Instant::now();
+            let us = u64::try_from(now.duration_since(self.0).as_micros()).unwrap_or(u64::MAX);
+            self.0 = now;
+            us
+        }
+    }
 }

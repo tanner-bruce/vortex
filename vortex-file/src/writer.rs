@@ -56,6 +56,8 @@ use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutWriterContext;
 use vortex_layout::layouts::file_stats::accumulate_stats;
 use vortex_layout::layouts::stitch::RangeLayout;
+#[cfg(feature = "bench-tail")]
+use vortex_layout::layouts::stitch::bench_tail::deferred_zones;
 use vortex_layout::layouts::stitch::stitch_range_layouts;
 use vortex_layout::layouts::zoned::writer::DeferredZones;
 use vortex_layout::layouts::zoned::writer::ZoneDeferral;
@@ -79,6 +81,10 @@ use crate::footer::FileStatistics;
 use crate::footer::MAX_METADATA_KEY_BYTES;
 use crate::footer::MAX_METADATA_SEGMENTS;
 use crate::footer::SegmentSpec;
+#[cfg(feature = "bench-tail")]
+use crate::footer::SerializerStamps;
+#[cfg(feature = "bench-tail")]
+use crate::footer::bench_tail;
 use crate::segments::writer::BufferedSegmentSink;
 
 /// Configure a new writer, which can eventually be used to write an [`ArrayStream`] into a sink
@@ -371,6 +377,8 @@ impl VortexWriteOptions {
         Ok(WriteSummary {
             footer,
             size: position,
+            #[cfg(feature = "bench-tail")]
+            finish_stamps: FinishStamps::default(),
         })
     }
 
@@ -975,6 +983,10 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
         if layouts.is_empty() {
             vortex_bail!("a stitched write needs at least one range");
         }
+        #[cfg(feature = "bench-tail")]
+        let mut finish_stamps = FinishStamps::default();
+        #[cfg(feature = "bench-tail")]
+        let mut finish_lap = bench_tail::Lap::start();
         let (_, eof) = SequenceId::root().split();
         let layout = stitch_range_layouts(
             layouts,
@@ -984,9 +996,28 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
             &options.session,
         )
         .await?;
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.stitch_us = finish_lap.lap();
+            let (us, calls) = deferred_zones();
+            finish_stamps.deferred_zones_us = us;
+            finish_stamps.deferred_zones = calls;
+        }
         let zone_segments = std::mem::take(&mut *sink.held.lock());
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.zone_segments = u32::try_from(zone_segments.len()).unwrap_or(u32::MAX);
+            finish_stamps.zone_segment_bytes = zone_segments
+                .iter()
+                .map(|segment| segment.padded_len())
+                .sum();
+        }
         for segment in zone_segments {
             output.write(segment).await?;
+        }
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.zone_segment_writes_us = finish_lap.lap();
         }
         if ctx.array_ctx().to_ids() != array_ids {
             vortex_bail!("the stitched zone tables interned array encodings after the ranges");
@@ -1002,6 +1033,10 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
             None,
             ReadContext::new(array_ids),
         );
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.footer_new_us = finish_lap.lap();
+        }
         let (footer_segment, metadata, approx_byte_size) = footer
             .clone()
             .into_serializer()
@@ -1013,16 +1048,57 @@ impl<W: VortexWrite + Unpin> StitchedWriter<W> {
         footer = footer
             .with_metadata_segments(metadata)
             .with_approx_byte_size(approx_byte_size);
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.serialize_us = finish_lap.lap();
+            finish_stamps.serializer = bench_tail::take();
+            finish_stamps.footer_bytes = footer_segment.padded_len();
+        }
 
         position += footer_segment.padded_len();
         output.write(footer_segment).await?;
         output.flush().await?;
+        #[cfg(feature = "bench-tail")]
+        {
+            finish_stamps.footer_write_us = finish_lap.lap();
+        }
 
         Ok(WriteSummary {
             footer,
             size: position,
+            #[cfg(feature = "bench-tail")]
+            finish_stamps,
         })
     }
+}
+
+/// ZY-184 bet 3 (Lease 6): test-only stamps of where [`StitchedWriter::finish`] spent its time,
+/// in microseconds, taken on the thread that ran it.
+#[cfg(feature = "bench-tail")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishStamps {
+    /// `stitch_range_layouts`: the join and the deferred zone maps together.
+    pub stitch_us: u64,
+    /// Inside the stitch: the `write_deferred_zones` calls.
+    pub deferred_zones_us: u64,
+    /// The number of `write_deferred_zones` calls.
+    pub deferred_zones: u32,
+    /// Zone-table segments the stitch held, written after it.
+    pub zone_segments: u32,
+    /// Their padded bytes.
+    pub zone_segment_bytes: u64,
+    /// Writing them to the output.
+    pub zone_segment_writes_us: u64,
+    /// Cloning the segment specs and `Footer::new`.
+    pub footer_new_us: u64,
+    /// `serialize_with_metadata`, split in `serializer`.
+    pub serialize_us: u64,
+    /// The serializer's own split.
+    pub serializer: SerializerStamps,
+    /// The footer segment's padded bytes.
+    pub footer_bytes: u64,
+    /// Writing the footer segment to the output and flushing it.
+    pub footer_write_us: u64,
 }
 
 /// Keeps a range's segments in sequence order, numbered from 0, each counted as buffered on
@@ -1119,6 +1195,8 @@ impl SegmentSink for StitchSegmentSink {
 pub struct WriteSummary {
     footer: Footer,
     size: u64,
+    #[cfg(feature = "bench-tail")]
+    finish_stamps: FinishStamps,
     // TODO(ngates): add a checksum
 }
 
@@ -1131,6 +1209,13 @@ impl WriteSummary {
     /// The total size of the written Vortex file in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// ZY-184 bet 3 (Lease 6): where [`StitchedWriter::finish`] spent its time; the default for
+    /// a serial write.
+    #[cfg(feature = "bench-tail")]
+    pub fn finish_stamps(&self) -> FinishStamps {
+        self.finish_stamps
     }
 
     /// The total number of rows in the written Vortex file.

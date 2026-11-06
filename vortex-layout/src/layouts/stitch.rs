@@ -59,6 +59,8 @@ pub async fn stitch_range_layouts(
     session: &VortexSession,
 ) -> VortexResult<LayoutRef> {
     vortex_ensure!(!ranges.is_empty(), "a stitch needs at least one range");
+    #[cfg(feature = "bench-tail")]
+    bench_tail::reset_deferred_zones();
     let bases: Vec<u32> = ranges.iter().map(|range| range.first_segment_id).collect();
     let mut zones: Vec<Vec<Option<DeferredZones>>> = Vec::with_capacity(ranges.len());
     let mut roots = Vec::with_capacity(ranges.len());
@@ -120,6 +122,8 @@ impl<'a> Stitch<'a> {
                 let deferred = self.take_zones(&nodes)?;
                 if let Some(parts) = deferred {
                     let data = self.join(nodes, eof, false).await?;
+                    #[cfg(feature = "bench-tail")]
+                    let _deferred_zones_timer = bench_tail::DeferredZonesTimer::start();
                     return write_deferred_zones(
                         parts,
                         data,
@@ -228,4 +232,47 @@ fn renumber(node: &LayoutRef, base: u32) -> VortexResult<LayoutRef> {
         flat.array_tree().cloned(),
     )
     .into_layout())
+}
+
+/// ZY-184 bet 3 (Lease 6): test-only stamps of the time a stitch spends in
+/// [`write_deferred_zones`], kept per thread, reset by [`stitch_range_layouts`] and read by the
+/// file writer right after it on the same thread.
+#[cfg(feature = "bench-tail")]
+pub mod bench_tail {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    thread_local! {
+        static DEFERRED_ZONES: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Forgets this thread's deferred-zone total; the next stitch starts from zero.
+    pub fn reset_deferred_zones() {
+        DEFERRED_ZONES.with(|cell| cell.set((0, 0)));
+    }
+
+    /// Microseconds spent in `write_deferred_zones` on this thread since the last reset, and
+    /// the number of calls.
+    pub fn deferred_zones() -> (u64, u32) {
+        DEFERRED_ZONES.with(Cell::get)
+    }
+
+    /// Adds the time since its start to this thread's deferred-zone total when dropped.
+    pub(super) struct DeferredZonesTimer(Instant);
+
+    impl DeferredZonesTimer {
+        pub(super) fn start() -> Self {
+            Self(Instant::now())
+        }
+    }
+
+    impl Drop for DeferredZonesTimer {
+        fn drop(&mut self) {
+            let us = u64::try_from(self.0.elapsed().as_micros()).unwrap_or(u64::MAX);
+            DEFERRED_ZONES.with(|cell| {
+                let (total, calls) = cell.get();
+                cell.set((total.saturating_add(us), calls.saturating_add(1)));
+            });
+        }
+    }
 }

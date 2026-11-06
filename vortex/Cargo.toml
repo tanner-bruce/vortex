@@ -92,6 +92,8 @@ wasm-bindgen = [
     "vortex-io/wasm-bindgen",
     "vortex-layout/wasm-bindgen",
 ]
+# ZY-184 bet 3 (Lease 6): test-only stamps of where a stitched write's finish spends its time.
+bench-tail = ["vortex-file?/bench-tail", "vortex-layout/bench-tail"]
 pretty = ["vortex-array/table-display"]
 serde = ["vortex-array/serde", "vortex-buffer/serde", "vortex-mask/serde"]
 # Exposes experimental row-function APIs without compatibility guarantees.

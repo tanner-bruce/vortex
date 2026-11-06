@@ -69,6 +69,9 @@ vortex-io = { path = "../vortex-io", features = ["tokio"] }
 [features]
 default = ["wasm-bindgen"]
 _test-harness = []
+# ZY-184 bet 3 (Lease 6): test-only stamps of where a stitch spends its time. Nothing in a
+# production build enables it.
+bench-tail = []
 tokio = ["dep:tokio", "vortex-error/tokio"]
 # `moka` enables uuid's `v4`, which needs a randomness source on wasm32-unknown-unknown.
 # Disable this to supply your own instead, by depending on uuid from your own manifest with

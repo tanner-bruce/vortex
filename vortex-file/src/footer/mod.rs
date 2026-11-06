@@ -17,6 +17,8 @@ mod segment;
 use std::sync::Arc;
 
 mod serializer;
+#[cfg(feature = "bench-tail")]
+pub(crate) use serializer::bench_tail;
 #[cfg(test)]
 mod verifier_tests;
 pub use serializer::*;

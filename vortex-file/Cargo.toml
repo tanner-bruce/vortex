@@ -89,3 +89,6 @@ tokio = [
 wasm-bindgen = ["vortex-layout/wasm-bindgen"]
 zstd = ["dep:vortex-zstd", "vortex-btrblocks/zstd", "vortex-btrblocks/pco"]
 tensor = ["dep:vortex-tensor"]
+# ZY-184 bet 3 (Lease 6): test-only stamps of where `StitchedWriter::finish` spends its time,
+# carried on `WriteSummary`. Nothing in a production build enables it.
+bench-tail = ["vortex-layout/bench-tail"]
