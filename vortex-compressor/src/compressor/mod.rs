@@ -4,6 +4,8 @@
 //! Cascading array compression implementation.
 
 mod cascade;
+#[cfg(feature = "leaf-census")]
+pub(crate) mod census;
 mod constant;
 mod pins;
 mod sample;
@@ -12,6 +14,8 @@ mod string_capacity;
 mod strings;
 mod structural;
 
+#[cfg(feature = "leaf-census")]
+pub use census::take_leaf_census;
 #[cfg(feature = "site-observer")]
 pub use pins::ObservedSite;
 pub use pins::PinSpec;

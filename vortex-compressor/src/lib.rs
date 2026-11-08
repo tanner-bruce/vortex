@@ -75,5 +75,7 @@ pub use compressor::PinTally;
 pub use compressor::SchemePins;
 pub use compressor::StringDictionaryCapacity;
 pub use compressor::StringDictionaryMemoryShape;
+#[cfg(feature = "leaf-census")]
+pub use compressor::take_leaf_census;
 
 mod trace;

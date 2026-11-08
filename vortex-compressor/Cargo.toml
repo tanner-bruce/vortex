@@ -35,6 +35,9 @@ vortex-session = { workspace = true }
 # Reports each searched site's key and decision, for offline pin generation. Not for production
 # builds.
 site-observer = []
+# Counts integer leaves by where they go after the constant check, for measurement builds. Not for
+# production builds.
+leaf-census = []
 
 [lints]
 workspace = true

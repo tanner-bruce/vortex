@@ -21,6 +21,8 @@ use super::FloatStats;
 use super::GenerateStatsOptions;
 use super::IntegerStats;
 use super::StringStats;
+#[cfg(feature = "leaf-census")]
+use crate::compressor::census;
 use crate::trace;
 
 /// A single cache entry: a concrete [`TypeId`] paired with a type-erased value.
@@ -203,6 +205,8 @@ impl ArrayAndStats {
                 .as_opt::<Primitive>()
                 .vortex_expect("the array is guaranteed to already be canonical by construction")
                 .into_owned();
+            #[cfg(feature = "leaf-census")]
+            census::full_integer_stats(opts.count_distinct_values, primitive.len());
             IntegerStats::generate_opts(&primitive, opts, ctx)
         })
     }

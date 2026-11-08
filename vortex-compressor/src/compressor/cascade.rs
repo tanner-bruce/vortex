@@ -35,6 +35,8 @@ use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
 use super::CascadingCompressor;
+#[cfg(feature = "leaf-census")]
+use super::census;
 use super::constant;
 use super::pins;
 use super::pins::Lookup;
@@ -445,6 +447,8 @@ impl CascadingCompressor {
             .fold(GenerateStatsOptions::default(), |acc, s| {
                 acc.merge(s.stats_options())
             });
+        #[cfg(feature = "leaf-census")]
+        let _replaying = census::replaying(None);
         let (data, before_nbytes) = build(opts, exec_ctx)?;
         self.choose_prepared(
             data,
@@ -478,7 +482,19 @@ impl CascadingCompressor {
             Ok(finished) => return Ok(Some(finished)),
             Err(data) => data,
         };
+        #[cfg(feature = "leaf-census")]
+        let is_int = data.array().dtype().is_int();
+        #[cfg(feature = "leaf-census")]
+        if is_int {
+            census::count(census::Group::Replayed, data.array_len());
+        }
+        #[cfg(feature = "leaf-census")]
+        let _replaying = census::replaying(Some(scheme.id().name));
         if !self.replay_admits(scheme, &data, ctx.clone(), exec_ctx)? {
+            #[cfg(feature = "leaf-census")]
+            if is_int {
+                census::count(census::Group::Declined, data.array_len());
+            }
             pins::count(Lookup::Declined);
             return Ok(None);
         }
@@ -508,6 +524,16 @@ impl CascadingCompressor {
             Ok(finished) => return Ok(finished),
             Err(data) => data,
         };
+        #[cfg(feature = "leaf-census")]
+        if !compress_ctx.is_sample() && data.array().dtype().is_int() {
+            let group = match planned {
+                Planned::Search => census::Group::Searched,
+                Planned::Unpinned => census::Group::Unpinned,
+                Planned::Ineligible => census::Group::Ineligible,
+                Planned::Canonical => census::Group::Canonical,
+            };
+            census::count(group, data.array_len());
+        }
         match planned {
             Planned::Search => {}
             Planned::Unpinned => pins::count(Lookup::Searched),
@@ -568,6 +594,10 @@ impl CascadingCompressor {
         // Constant detection is built into the compressor: a constant leaf always short-circuits
         // scheme selection.
         if !compress_ctx.is_sample() && constant::is_constant_for_compression(&data, exec_ctx)? {
+            #[cfg(feature = "leaf-census")]
+            if data.array().dtype().is_int() {
+                census::count(census::Group::Constant, data.array_len());
+            }
             let _winner_span =
                 trace::winner_compress_span(constant::CONSTANT_SCHEME_ID, before_nbytes).entered();
             let compressed = constant::compress_constant(data.array(), exec_ctx)?;
