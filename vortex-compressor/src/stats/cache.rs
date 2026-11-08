@@ -67,6 +67,22 @@ impl StatsCache {
             new_arc
         }
     }
+
+    /// Returns a cached value, or `None` without computing it.
+    fn get<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        let type_id = TypeId::of::<T>();
+        let guard = self.entries.lock();
+
+        guard
+            .iter()
+            .find(|(id, _)| *id == type_id)
+            .map(|(_, entry)| {
+                Arc::clone(entry)
+                    .downcast::<T>()
+                    .ok()
+                    .vortex_expect("we just checked the TypeID")
+            })
+    }
 }
 
 /// An array bundled with its lazily-computed statistics cache.
@@ -189,6 +205,11 @@ impl ArrayAndStats {
                 .into_owned();
             IntegerStats::generate_opts(&primitive, opts, ctx)
         })
+    }
+
+    /// Returns integer stats if they were already generated, without generating them.
+    pub(crate) fn cached_integer_stats(&self) -> Option<Arc<IntegerStats>> {
+        self.cache.get::<IntegerStats>()
     }
 
     /// Returns float stats, generating them lazily on first access.
