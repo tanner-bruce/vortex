@@ -19,6 +19,8 @@ use vortex_session::registry::ReadContext;
 
 use crate::LayoutBuildContext;
 use crate::LayoutRef;
+use crate::VisitCx;
+use crate::VisitedPosition;
 use crate::layouts::foreign::new_foreign_layout;
 use crate::segments::SegmentId;
 use crate::session::LayoutRegistry;
@@ -31,6 +33,32 @@ pub trait LayoutChildren: 'static + Send + Sync {
     fn to_arc(&self) -> Arc<dyn LayoutChildren>;
 
     fn child(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef>;
+
+    /// Build without retaining a newly constructed child, where supported.
+    fn child_uncached(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
+        self.child(idx, dtype)
+    }
+
+    /// Visit one child at the position selected by the caller.
+    fn visit_child(&self, idx: usize, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        cx.materialised(self.child(idx, dtype)?.as_ref())
+    }
+
+    /// Visit row chunks in order, borrowing the parent's dtype for the whole batch.
+    fn visit_children(&self, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        let mut offset = 0;
+        for idx in 0..self.nchildren() {
+            cx.position = VisitedPosition::Positioned(cx.row_offsets().then_some(offset));
+            self.visit_child(idx, dtype, cx)?;
+            offset += self.child_row_count(idx);
+        }
+        Ok(())
+    }
+
+    /// Number of retained child cache entries, when this adapter has a cache.
+    fn cached_children(&self) -> usize {
+        0
+    }
 
     fn child_row_count(&self, idx: usize) -> u64;
 
@@ -62,6 +90,19 @@ impl LayoutChildren for Arc<dyn LayoutChildren> {
 
     fn child(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
         self.as_ref().child(idx, dtype)
+    }
+
+    fn child_uncached(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
+        self.as_ref().child_uncached(idx, dtype)
+    }
+    fn visit_child(&self, idx: usize, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        self.as_ref().visit_child(idx, dtype, cx)
+    }
+    fn visit_children(&self, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        self.as_ref().visit_children(dtype, cx)
+    }
+    fn cached_children(&self) -> usize {
+        self.as_ref().cached_children()
     }
 
     fn child_row_count(&self, idx: usize) -> u64 {
@@ -156,6 +197,7 @@ impl ViewedLayoutChildren {
         let fb_children = unsafe { fbl::Layout::follow(flatbuffer.as_ref(), flatbuffer_loc) }
             .children()
             .unwrap_or_default();
+        crate::visit::record_children_construction(fb_children.len());
         let cache = vec![OnceCell::new(); fb_children.len()]
             .into_boxed_slice()
             .into();
@@ -189,6 +231,73 @@ impl ViewedLayoutChildren {
         // as it was constructed from a validated flatbuffer in ViewedLayoutChildren::try_new.
         // The lifetime of the returned Layout is tied to self, ensuring the buffer remains valid.
         unsafe { fbl::Layout::follow(self.flatbuffer.as_ref(), self.flatbuffer_loc) }
+    }
+
+    pub(super) fn build_child(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
+        self.build_layout(
+            self.flatbuffer().children().unwrap_or_default().get(idx),
+            dtype,
+        )
+    }
+
+    // Cached, uncached and unmodelled visits all use the original build body.
+    pub(super) fn build_layout(
+        &self,
+        fb_child: fbl::Layout<'_>,
+        dtype: &DType,
+    ) -> VortexResult<LayoutRef> {
+        // SAFETY: same validated flatbuffer; fb_child._tab.loc() is a valid offset
+        // We need this to avoid re-initializing cache here
+        let viewed_children = unsafe {
+            ViewedLayoutChildren::new_unchecked(
+                self.flatbuffer.clone(),
+                fb_child._tab.loc(),
+                self.array_read_ctx.clone(),
+                self.layout_read_ctx.clone(),
+                self.layouts.clone(),
+                self.allow_unknown,
+                self.session.clone(),
+            )
+        };
+
+        let encoding_id = self
+            .layout_read_ctx
+            .resolve(fb_child.encoding())
+            .ok_or_else(|| vortex_err!("Unknown layout encoding index: {}", fb_child.encoding()))?;
+        let Some(encoding) = self.layouts.get(&encoding_id) else {
+            if self.allow_unknown {
+                return viewed_children.foreign_layout_from_fb(fb_child, dtype);
+            }
+            vortex_bail!("Unknown layout encoding: {encoding_id}");
+        };
+
+        let build_ctx = LayoutBuildContext {
+            session: &self.session,
+            array_read_ctx: &self.array_read_ctx,
+        };
+        encoding.build(
+            dtype,
+            fb_child.row_count(),
+            fb_child
+                .metadata()
+                .map(|m| m.bytes())
+                .unwrap_or_else(|| &[]),
+            fb_child
+                .segments()
+                .unwrap_or_default()
+                .iter()
+                .map(SegmentId::from)
+                .collect_vec(),
+            &viewed_children,
+            &build_ctx,
+        )
+    }
+
+    pub(super) fn read_context(&self) -> &ReadContext {
+        &self.layout_read_ctx
+    }
+    pub(super) fn registry(&self) -> &LayoutRegistry {
+        &self.layouts
     }
 
     fn foreign_layout_from_fb(
@@ -237,58 +346,56 @@ impl LayoutChildren for ViewedLayoutChildren {
             vortex_bail!("Child index out of bounds: {} of {}", idx, self.nchildren());
         }
 
-        let layout_ref = self.cache[idx].get_or_try_init(|| {
-            let fb_child = self.flatbuffer().children().unwrap_or_default().get(idx);
-
-            // SAFETY: same validated flatbuffer; fb_child._tab.loc() is a valid offset
-            // We need this to avoid re-initializing cache here
-            let viewed_children = unsafe {
-                ViewedLayoutChildren::new_unchecked(
-                    self.flatbuffer.clone(),
-                    fb_child._tab.loc(),
-                    self.array_read_ctx.clone(),
-                    self.layout_read_ctx.clone(),
-                    self.layouts.clone(),
-                    self.allow_unknown,
-                    self.session.clone(),
-                )
-            };
-
-            let encoding_id = self
-                .layout_read_ctx
-                .resolve(fb_child.encoding())
-                .ok_or_else(|| {
-                    vortex_err!("Unknown layout encoding index: {}", fb_child.encoding())
-                })?;
-            let Some(encoding) = self.layouts.get(&encoding_id) else {
-                if self.allow_unknown {
-                    return viewed_children.foreign_layout_from_fb(fb_child, dtype);
-                }
-                vortex_bail!("Unknown layout encoding: {encoding_id}");
-            };
-
-            let build_ctx = LayoutBuildContext {
-                session: &self.session,
-                array_read_ctx: &self.array_read_ctx,
-            };
-            encoding.build(
-                dtype,
-                fb_child.row_count(),
-                fb_child
-                    .metadata()
-                    .map(|m| m.bytes())
-                    .unwrap_or_else(|| &[]),
-                fb_child
-                    .segments()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(SegmentId::from)
-                    .collect_vec(),
-                &viewed_children,
-                &build_ctx,
-            )
-        })?;
+        let layout_ref = self.cache[idx].get_or_try_init(|| self.build_child(idx, dtype))?;
         Ok(Arc::clone(layout_ref))
+    }
+
+    fn child_uncached(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
+        if idx >= self.nchildren() {
+            vortex_bail!("Child index out of bounds: {} of {}", idx, self.nchildren());
+        }
+        match self.cache[idx].get() {
+            Some(child) => Ok(Arc::clone(child)),
+            None => self.build_child(idx, dtype),
+        }
+    }
+
+    fn visit_child(&self, idx: usize, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        if idx >= self.nchildren() {
+            vortex_bail!("Child index out of bounds: {} of {}", idx, self.nchildren());
+        }
+        if let Some(child) = self.cache[idx].get() {
+            cx.materialised(child.as_ref())
+        } else {
+            cx.flatbuffer(
+                self,
+                self.flatbuffer().children().unwrap_or_default().get(idx),
+                dtype,
+            )
+        }
+    }
+
+    fn visit_children(&self, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        let children = self.flatbuffer().children().unwrap_or_default();
+        let mut offset = 0;
+        for (idx, child) in children.iter().enumerate() {
+            cx.position = VisitedPosition::Positioned(cx.row_offsets().then_some(offset));
+            if let Some(cached) = self.cache[idx].get() {
+                cx.materialised(cached.as_ref())?;
+            } else {
+                cx.stats.batch_children += 1;
+                cx.flatbuffer(self, child, dtype)?;
+            }
+            offset += child.row_count();
+        }
+        Ok(())
+    }
+
+    fn cached_children(&self) -> usize {
+        self.cache
+            .iter()
+            .filter(|entry| entry.get().is_some())
+            .count()
     }
 
     fn child_row_count(&self, idx: usize) -> u64 {
