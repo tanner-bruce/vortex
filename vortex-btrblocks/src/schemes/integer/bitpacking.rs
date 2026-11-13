@@ -92,6 +92,10 @@ impl Scheme for BitPackingScheme {
         canonical.dtype().is_int()
     }
 
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn produced_encodings(&self) -> Vec<ArrayId> {
         let mut encodings = match self.mode {
             // Global-width arrays serialize under the frozen v1 ID.

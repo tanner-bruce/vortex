@@ -5,9 +5,20 @@
 
 mod cascade;
 mod constant;
+mod pins;
 mod sample;
 mod select;
+mod string_capacity;
+mod strings;
 mod structural;
+
+#[cfg(feature = "site-observer")]
+pub use pins::ObservedSite;
+pub use pins::PinSpec;
+pub use pins::PinTally;
+pub use pins::SchemePins;
+pub use string_capacity::StringDictionaryCapacity;
+pub use string_capacity::StringDictionaryMemoryShape;
 
 use crate::builtins::IntDictScheme;
 use crate::scheme::ChildSelection;
@@ -42,13 +53,27 @@ pub(crate) const ROOT_SCHEME_ID: SchemeId = SchemeId {
 pub struct CascadingCompressor {
     /// The enabled compression schemes.
     schemes: Vec<&'static dyn Scheme>,
+    /// Opt-in logical string scoring and dictionary reuse.
+    string_dictionary_reuse: bool,
 
     /// Descendant exclusion rules for the compressor's own cascading (e.g. excluding Dict from
     /// list offsets).
     root_exclusions: Vec<DescendantExclusion>,
+
+    /// Pinned decisions per site, replayed instead of searched.
+    pins: Option<&'static SchemePins>,
 }
 
 impl CascadingCompressor {
+    /// Enables packed string comparisons and reuse of existing UInt32 dictionaries.
+    ///
+    /// This changes string selection scores within this compressor. Schemes without
+    /// dictionary eligibility retain the legacy canonical path. Disabled by default.
+    pub fn with_string_dictionary_reuse(mut self, enabled: bool) -> Self {
+        self.string_dictionary_reuse = enabled;
+        self
+    }
+
     /// Creates a new compressor with the given schemes.
     ///
     /// Root-level exclusion rules (e.g. excluding Dict from list offsets) are built automatically.
@@ -62,12 +87,32 @@ impl CascadingCompressor {
 
         Self {
             schemes,
+            string_dictionary_reuse: false,
             root_exclusions,
+            pins: None,
         }
+    }
+
+    /// Replays `pins` at the sites they pin instead of searching there (see [`SchemePins`]).
+    ///
+    /// The table should be resolved against this compressor's schemes: a pinned scheme this
+    /// compressor does not have is ineligible everywhere, and those sites search.
+    pub fn with_pins(mut self, pins: &'static SchemePins) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
+    /// Returns whether the compressor was configured with `scheme`.
+    pub fn has_scheme(&self, scheme: SchemeId) -> bool {
+        self.schemes
+            .iter()
+            .any(|candidate| candidate.id() == scheme)
     }
 }
 
 // NB: Cascading compression logic is located in `vortex-compressor/src/compressor/cascade.rs`.
 
+#[cfg(test)]
+mod pins_tests;
 #[cfg(test)]
 mod tests;

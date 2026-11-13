@@ -51,6 +51,7 @@ pub struct BytesDictBuilder<Code> {
     dtype: DType,
     max_dict_bytes: usize,
     max_dict_len: usize,
+    allow_oversized_first_entry: bool,
     allocator: BufferAllocatorRef,
 }
 
@@ -58,27 +59,32 @@ pub fn bytes_dict_builder(
     dtype: DType,
     constraints: &DictConstraints,
     allocator: BufferAllocatorRef,
+    allow_oversized_first_entry: bool,
 ) -> Box<dyn DictEncoder> {
     match constraints.max_len as u64 {
         max if max <= u8::MAX as u64 => Box::new(BytesDictBuilder::<u8>::new_in(
             dtype,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         max if max <= u16::MAX as u64 => Box::new(BytesDictBuilder::<u16>::new_in(
             dtype,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         max if max <= u32::MAX as u64 => Box::new(BytesDictBuilder::<u32>::new_in(
             dtype,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         _ => Box::new(BytesDictBuilder::<u64>::new_in(
             dtype,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
     }
 }
@@ -88,6 +94,7 @@ impl<Code: UnsignedPType> BytesDictBuilder<Code> {
         dtype: DType,
         constraints: &DictConstraints,
         allocator: BufferAllocatorRef,
+        allow_oversized_first_entry: bool,
     ) -> Self {
         Self {
             lookup: Some(HashTable::new()),
@@ -102,6 +109,7 @@ impl<Code: UnsignedPType> BytesDictBuilder<Code> {
             dtype,
             max_dict_bytes: constraints.max_bytes.min(u32::MAX as usize),
             max_dict_len: constraints.max_len,
+            allow_oversized_first_entry,
             allocator,
         }
     }
@@ -130,7 +138,7 @@ impl<Code: UnsignedPType> BytesDictBuilder<Code> {
             HashTableEntry::Occupied(occupied) => Some(*occupied.get()),
             HashTableEntry::Vacant(vacant) => {
                 // Admit the first entry even if it exceeds the budget, so the caller makes progress.
-                let is_first_entry = self.views.is_empty();
+                let is_first_entry = self.allow_oversized_first_entry && self.views.is_empty();
 
                 if !is_first_entry && self.views.len() >= self.max_dict_len {
                     return None;
@@ -173,7 +181,7 @@ impl<Code: UnsignedPType> BytesDictBuilder<Code> {
             return Some(*code);
         }
 
-        if !self.views.is_empty()
+        if !(self.allow_oversized_first_entry && self.views.is_empty())
             && (self.views.len() >= self.max_dict_len
                 || self.dict_bytes() + size_of::<BinaryView>() > self.max_dict_bytes)
         {
@@ -516,6 +524,7 @@ mod test {
             DType::Utf8(Nullability::NonNullable),
             &UNCONSTRAINED,
             BufferAllocatorRef::statically_allocated(),
+            true,
         );
         assert_eq!(builder.max_dict_bytes, u32::MAX as usize);
     }

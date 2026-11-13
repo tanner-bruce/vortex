@@ -7,7 +7,9 @@ use vortex_array::ExecutionCtx;
 use vortex_error::VortexResult;
 
 use super::ROOT_SCHEME_ID;
+use super::sample::estimate_compression_ratio_from_sample;
 use super::sample::estimate_compression_ratio_with_sampling;
+use super::sample::prepare_sample;
 use crate::CascadingCompressor;
 use crate::scheme::CompressionEstimate;
 use crate::scheme::CompressorContext;
@@ -97,18 +99,39 @@ impl CascadingCompressor {
 
         // Pass 2: run deferred work. Callbacks receive the current best as a threshold so they can
         // short-circuit with `Skip` when they cannot beat it.
+        // Logical string trials use identical packed rows. Retain one sample only
+        // for this selection call; each scheme still gets its own statistics.
+        let mut string_sample = None;
         for (scheme, deferred_estimate) in deferred {
             let _span = trace::scheme_eval_span(scheme.id()).entered();
             let threshold: Option<EstimateScore> = best.map(|(_, score)| score);
             match deferred_estimate {
                 DeferredEstimate::Sample => {
-                    let score = estimate_compression_ratio_with_sampling(
-                        self,
-                        scheme,
-                        data.array(),
-                        compress_ctx.clone(),
-                        exec_ctx,
-                    )?;
+                    let score = if compress_ctx.logical_strings && data.array().dtype().is_utf8() {
+                        let sample = match &string_sample {
+                            Some(sample) => sample,
+                            None => string_sample.insert(prepare_sample(
+                                data.array(),
+                                &compress_ctx,
+                                exec_ctx,
+                            )?),
+                        };
+                        estimate_compression_ratio_from_sample(
+                            self,
+                            scheme,
+                            sample.clone(),
+                            compress_ctx.clone(),
+                            exec_ctx,
+                        )?
+                    } else {
+                        estimate_compression_ratio_with_sampling(
+                            self,
+                            scheme,
+                            data.array(),
+                            compress_ctx.clone(),
+                            exec_ctx,
+                        )?
+                    };
 
                     if is_better_score(score, best.as_ref()) {
                         best = Some((scheme, score));
@@ -133,6 +156,32 @@ impl CascadingCompressor {
         }
 
         Ok(best.map(|(scheme, score)| (scheme, WinnerEstimate::Score(score))))
+    }
+
+    /// Whether a pinned `scheme` admits `data` by its own estimate, without sampling: a sample
+    /// estimate admits, a skip verdict or a ratio a search would not accept (such as FoR's 1.0 on
+    /// a signed range that wraps) declines, and a callback (such as `SequenceScheme`'s
+    /// feasibility check) runs with no threshold.
+    pub(super) fn replay_admits(
+        &self,
+        scheme: &'static dyn Scheme,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool> {
+        let verdict = match scheme.expected_compression_ratio(data, compress_ctx.clone(), exec_ctx)
+        {
+            CompressionEstimate::Verdict(verdict) => verdict,
+            CompressionEstimate::Deferred(DeferredEstimate::Sample) => return Ok(true),
+            CompressionEstimate::Deferred(DeferredEstimate::Callback(callback)) => {
+                callback(self, data, None, compress_ctx, exec_ctx)?
+            }
+        };
+        Ok(match verdict {
+            EstimateVerdict::Skip => false,
+            EstimateVerdict::AlwaysUse => true,
+            EstimateVerdict::Ratio(ratio) => EstimateScore::FiniteCompression(ratio).is_valid(),
+        })
     }
 
     // TODO(connor): Lots of room for optimization here.

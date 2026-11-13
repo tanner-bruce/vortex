@@ -32,7 +32,6 @@ use vortex_array::dtype::Nullability;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::DefaultHashBuilder;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -174,7 +173,6 @@ impl LayoutStrategy for StructStrategy {
 
         // Fan out column chunks to their respective transposed streams. Keep this future joined
         // with the column writers so producer panics/errors cannot be hidden as channel EOF.
-        let handle = session.handle();
         let fanout_fut = async move {
             pin_mut!(columns_vec_stream);
             while let Some(result) = columns_vec_stream.next().await {
@@ -236,24 +234,24 @@ impl LayoutStrategy for StructStrategy {
                     ctx.clone()
                 };
                 let segment_sink = Arc::clone(&segment_sink);
-                handle.spawn_nested(move |_| {
-                    // Validity is written through the validity strategy; every other field
-                    // resolves to its named override or the default strategy.
-                    let writer = if is_validity {
-                        Arc::clone(&self.validity)
-                    } else {
-                        self.field_writers
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_else(|| Arc::clone(&self.default))
-                    };
+                // Validity is written through the validity strategy; every other field
+                // resolves to its named override or the default strategy.
+                let writer = if is_validity {
+                    Arc::clone(&self.validity)
+                } else {
+                    self.field_writers
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&self.default))
+                };
 
-                    async move {
-                        writer
-                            .write_stream(ctx, segment_sink, column_stream, child_eof, &session)
-                            .await
-                    }
-                })
+                // The column writers are joined on this task. Their compression runs on the CPU
+                // pool, so the columns still compress in parallel.
+                async move {
+                    writer
+                        .write_stream(ctx, segment_sink, column_stream, child_eof, &session)
+                        .await
+                }
             })
             .collect();
 

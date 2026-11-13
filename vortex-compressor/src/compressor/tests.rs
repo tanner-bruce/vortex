@@ -15,6 +15,7 @@ use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_si
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::Constant;
+use vortex_array::arrays::Dict;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
@@ -959,5 +960,191 @@ fn extension_with_lazy_storage_is_not_passed_through() -> VortexResult<()> {
         compressed.display_tree()
     );
     assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CanonicalStringScheme;
+
+impl Scheme for CanonicalStringScheme {
+    fn scheme_name(&self) -> &'static str {
+        "test.canonical_string"
+    }
+    fn matches(&self, canonical: &Canonical) -> bool {
+        canonical.dtype().is_utf8()
+    }
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        vec![]
+    }
+    fn expected_compression_ratio(
+        &self,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        assert_eq!(data.array_as_varbinview().len(), data.array_len());
+        CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse)
+    }
+    fn compress(
+        &self,
+        _: &CascadingCompressor,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        Ok(data.array().clone())
+    }
+}
+
+#[test]
+fn dictionary_reuse_preserves_external_canonical_scheme_fallback() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let dict = DictArray::try_new(
+        PrimitiveArray::from_iter((0..4096).map(|i| i % 2_u32)).into_array(),
+        VarBinViewArray::from_iter_str(["first repeated long value", "second repeated long value"])
+            .into_array(),
+    )?
+    .into_array();
+    let legacy = CascadingCompressor::new(vec![&CanonicalStringScheme]);
+    let expected = legacy.compress(&dict, &mut ctx)?;
+    let actual = legacy
+        .with_string_dictionary_reuse(true)
+        .compress(&dict, &mut ctx)?;
+    assert_eq!(actual.nbytes(), expected.nbytes());
+    assert_arrays_eq!(&expected, &actual, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn dictionary_reuse_keeps_high_cardinality_gate_and_cascade_limits() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = compressor().with_string_dictionary_reuse(true);
+    let values = VarBinViewArray::from_iter(
+        (0..100).map(|i| Some(format!("{i:04} distinct string"))),
+        DType::Utf8(Nullability::NonNullable),
+    )
+    .into_array();
+    let unique = DictArray::try_new(PrimitiveArray::from_iter(0..100_u32).into_array(), values)?
+        .into_array();
+    let output = compressor.compress(&unique, &mut ctx)?;
+    assert!(!output.is::<Dict>());
+    assert_arrays_eq!(&unique, &output, &mut ctx);
+    let limited = compressor.compress_child(
+        &unique,
+        &CompressorContext::new().as_leaf(),
+        StringDictScheme.id(),
+        0,
+        &mut ctx,
+    )?;
+    assert!(limited.is::<Dict>());
+    assert_arrays_eq!(&unique, &limited, &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn dictionary_reuse_detects_constants_from_referenced_values() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = CascadingCompressor::new(Vec::new()).with_string_dictionary_reuse(true);
+    for (values, codes, constant) in [
+        (
+            vec![Some("unused"), Some("same"), Some("same")],
+            vec![Some(1_u32), Some(2)],
+            true,
+        ),
+        (vec![Some("same"), None], vec![Some(0), Some(1)], false),
+        (vec![Some("same")], vec![Some(0), None], false),
+        (vec![Some("unused"), None], vec![Some(1), None], true),
+    ] {
+        let source = DictArray::try_new(
+            PrimitiveArray::from_option_iter(codes).into_array(),
+            VarBinViewArray::from_iter_nullable_str(values).into_array(),
+        )?
+        .into_array();
+        let output = compressor.compress(&source, &mut ctx)?;
+        assert_eq!(output.is::<Constant>(), constant);
+        assert_arrays_eq!(&source, &output, &mut ctx);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InspectStringSample {
+    name: &'static str,
+    count_distinct_values: bool,
+    samples: Arc<Mutex<Vec<ArrayRef>>>,
+}
+
+impl Scheme for InspectStringSample {
+    fn scheme_name(&self) -> &'static str {
+        self.name
+    }
+    fn matches(&self, canonical: &Canonical) -> bool {
+        canonical.dtype().is_utf8()
+    }
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+    fn stats_options(&self) -> GenerateStatsOptions {
+        GenerateStatsOptions {
+            count_distinct_values: self.count_distinct_values,
+        }
+    }
+    fn expected_compression_ratio(
+        &self,
+        _: &ArrayAndStats,
+        _: CompressorContext,
+        _: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        CompressionEstimate::Deferred(DeferredEstimate::Sample)
+    }
+    fn compress(
+        &self,
+        _: &CascadingCompressor,
+        data: &ArrayAndStats,
+        _: CompressorContext,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        assert_eq!(
+            data.varbinview_stats(ctx)
+                .estimated_distinct_count()
+                .is_some(),
+            self.count_distinct_values
+        );
+        self.samples.lock().push(data.array().clone());
+        Ok(PrimitiveArray::from_iter(std::iter::repeat_n(0_u8, data.array_len())).into_array())
+    }
+}
+
+#[test]
+fn logical_strings_share_only_sample_storage_between_scheme_trials() -> VortexResult<()> {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let first = Box::leak(Box::new(InspectStringSample {
+        name: "test.sample_first",
+        count_distinct_values: false,
+        samples: Arc::clone(&samples),
+    }));
+    let second = Box::leak(Box::new(InspectStringSample {
+        name: "test.sample_second",
+        count_distinct_values: true,
+        samples: Arc::clone(&samples),
+    }));
+    let schemes: [&'static dyn Scheme; 2] = [first, second];
+    let compressor = CascadingCompressor::new(schemes.to_vec());
+    let input = VarBinViewArray::from_iter_str((0..4096).map(|_| "a repeated outlined string"))
+        .into_array();
+    let data = ArrayAndStats::new(input, GenerateStatsOptions::default());
+    let mut ctx = SESSION.create_execution_ctx();
+    for _ in 0..2 {
+        let mut compress_ctx = CompressorContext::new();
+        compress_ctx.logical_strings = true;
+        let winner = compressor.choose_best_scheme(&schemes, &data, compress_ctx, &mut ctx)?;
+        assert_eq!(winner.expect("sample winner").0.id(), first.id());
+    }
+    let samples = samples.lock();
+    assert_eq!(samples.len(), 4);
+    assert_eq!(samples[0].len(), 1024);
+    assert!(ArrayRef::ptr_eq(&samples[0], &samples[1]));
+    assert!(ArrayRef::ptr_eq(&samples[2], &samples[3]));
+    assert!(!ArrayRef::ptr_eq(&samples[0], &samples[2]));
     Ok(())
 }

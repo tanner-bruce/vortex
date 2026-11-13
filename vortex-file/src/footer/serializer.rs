@@ -3,15 +3,25 @@
 
 use std::sync::Arc;
 
+use flatbuffers::Follow;
+use flatbuffers::Verifiable;
+use flatbuffers::VerifierOptions;
+use flatbuffers::root_with_opts;
+use vortex_array::flatbuffers::FILE_METADATA_VERIFIER_OPTIONS;
 use vortex_array::flatbuffers::FlatBuffer;
 use vortex_array::flatbuffers::FlatBufferRoot;
 use vortex_array::flatbuffers::WriteFlatBuffer;
 use vortex_array::flatbuffers::WriteFlatBufferExt;
+use vortex_array::flatbuffers::dtype as fbd;
 use vortex_buffer::ByteBuffer;
+use vortex_buffer::segment::Piece;
+use vortex_buffer::segment::Segment;
+use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_layout::LayoutContext;
+use vortex_layout::flatbuffers::layout as fbl;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -21,6 +31,7 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::MAX_POSTSCRIPT_SIZE;
 use crate::VERSION;
+use crate::flatbuffers::footer as fb;
 use crate::footer::SegmentSpec;
 use crate::footer::file_layout::FooterFlatBufferWriter;
 use crate::footer::postscript::Postscript;
@@ -35,6 +46,7 @@ pub struct FooterSerializer {
     offset: u64,
     layout_ctx: LayoutContext,
     session: VortexSession,
+    verifier_options: VerifierOptions,
 }
 
 impl FooterSerializer {
@@ -46,7 +58,16 @@ impl FooterSerializer {
             offset: 0,
             layout_ctx: LayoutContext::default(),
             session,
+            verifier_options: FILE_METADATA_VERIFIER_OPTIONS,
         }
+    }
+
+    /// Verify serialized metadata flatbuffers with `options` instead of
+    /// [`FILE_METADATA_VERIFIER_OPTIONS`], so tests can exercise the limits with small files.
+    #[cfg(test)]
+    pub(crate) fn with_verifier_options(mut self, options: VerifierOptions) -> Self {
+        self.verifier_options = options;
+        self
     }
 
     /// Serialize layouts through `layout_ctx`.
@@ -90,14 +111,29 @@ impl FooterSerializer {
     /// Serialize the footer into a byte buffer that can later be deserialized as a [`Footer`].
     /// This can be helpful for storing some footer data out-of-band to accelerate opening a file.
     pub fn serialize(self) -> VortexResult<Vec<ByteBuffer>> {
-        self.serialize_with_metadata()
-            .map(|(buffers, _metadata, _approx_byte_size)| buffers)
+        let (segment, _metadata, _approx_byte_size) = self.serialize_with_metadata()?;
+        let mut data = segment.buffers().iter();
+        Ok(segment
+            .piece_list()
+            .iter()
+            .map(|piece| match *piece {
+                Piece::Zeros(len) => ByteBuffer::zeroed(len as usize),
+                Piece::Buffer => data
+                    .next()
+                    .vortex_expect("a buffer piece has a buffer")
+                    .clone(),
+                Piece::Framing { start, end } => {
+                    ByteBuffer::copy_from(&segment.framing()[start as usize..end as usize])
+                }
+            })
+            .collect())
     }
 
+    /// Serialize the footer as one segment, starting at the configured offset.
     pub(crate) fn serialize_with_metadata(
         mut self,
-    ) -> VortexResult<(Vec<ByteBuffer>, super::MetadataSegments, usize)> {
-        let mut buffers = vec![];
+    ) -> VortexResult<(Segment, super::MetadataSegments, usize)> {
+        let mut buffers = Segment::new();
 
         let (metadata_segments, metadata_locators) = if self.metadata.is_empty() {
             let locators = self
@@ -121,20 +157,20 @@ impl FooterSerializer {
             let mut segments = Vec::with_capacity(metadata.len());
             let mut locators = Vec::with_capacity(metadata.len());
             for (key, metadata) in metadata {
-                let (metadata_buffers, segment) = write_buffer(&mut self.offset, metadata)?;
-                buffers.extend(metadata_buffers);
+                let segment = write_buffer(&mut self.offset, &mut buffers, metadata)?;
                 locators.push((key.clone(), SegmentSpec::from(&segment)));
                 segments.push(PostscriptMetadata { key, segment });
             }
             (segments, locators)
         };
-        let metadata_storage_bytes = buffers.iter().map(ByteBuffer::len).sum::<usize>();
+        let metadata_storage_bytes = buffers.len();
 
         let dtype_segment = if self.exclude_dtype {
             None
         } else {
             let (buffer, dtype_segment) = write_flatbuffer(&mut self.offset, self.footer.dtype())?;
-            buffers.push(buffer);
+            verify_readable::<fbd::DType>(&self.verifier_options, "dtype", &buffer)?;
+            buffers.push_buffer(buffer);
             Some(dtype_segment)
         };
 
@@ -149,14 +185,20 @@ impl FooterSerializer {
                 .layout()
                 .flatbuffer_writer(&layout_ctx, &self.session),
         )?;
-        buffers.push(buffer);
+        verify_readable::<fbl::Layout>(&self.verifier_options, "layout", &buffer)?;
+        buffers.push_buffer(buffer);
 
         let statistics_segment = match self.footer.statistics() {
             None => None,
             Some(stats) if stats.is_empty() => None,
             Some(stats) => {
                 let (buffer, stats_segment) = write_flatbuffer(&mut self.offset, stats)?;
-                buffers.push(buffer);
+                verify_readable::<fb::FileStatistics>(
+                    &self.verifier_options,
+                    "file statistics",
+                    &buffer,
+                )?;
+                buffers.push_buffer(buffer);
                 Some(stats_segment)
             }
         };
@@ -169,7 +211,8 @@ impl FooterSerializer {
                 segment_specs: Arc::clone(&self.footer.segments),
             },
         )?;
-        buffers.push(buffer);
+        verify_readable::<fb::Footer>(&self.verifier_options, "footer", &buffer)?;
+        buffers.push_buffer(buffer);
 
         // Assemble the postscript, and write it manually to avoid any framing.
         let postscript = Postscript {
@@ -180,6 +223,11 @@ impl FooterSerializer {
             metadata: metadata_segments,
         };
         let postscript_buffer = postscript.write_flatbuffer_bytes()?;
+        verify_readable::<fb::Postscript>(
+            &self.verifier_options,
+            "postscript",
+            &postscript_buffer,
+        )?;
         if postscript_buffer.len() > MAX_POSTSCRIPT_SIZE as usize {
             Err(vortex_err!(
                 "Postscript is too large ({} bytes); max postscript size is {}",
@@ -190,19 +238,45 @@ impl FooterSerializer {
 
         let postscript_len = u16::try_from(postscript_buffer.len())
             .vortex_expect("Postscript already verified to fit into u16");
-        buffers.push(postscript_buffer.into_inner());
+        buffers.push_buffer(postscript_buffer.into_inner());
 
         // And finally, the EOF 8-byte footer.
         let mut eof = [0u8; EOF_SIZE];
         eof[0..2].copy_from_slice(&VERSION.to_le_bytes());
         eof[2..4].copy_from_slice(&postscript_len.to_le_bytes());
         eof[4..8].copy_from_slice(&MAGIC_BYTES);
-        buffers.push(ByteBuffer::copy_from(eof));
+        buffers.push_framing_bytes(&eof);
 
-        let approx_byte_size =
-            buffers.iter().map(ByteBuffer::len).sum::<usize>() - metadata_storage_bytes;
+        let approx_byte_size = usize::try_from(buffers.len() - metadata_storage_bytes)
+            .vortex_expect("the footer fits in memory");
         Ok((buffers, metadata_locators.into(), approx_byte_size))
     }
+}
+
+/// Fails the write when readers would reject a serialized metadata flatbuffer.
+///
+/// Writers use [`FILE_METADATA_VERIFIER_OPTIONS`]. Readers verify each metadata flatbuffer with
+/// options that are never stricter, so a buffer that passes here can be opened. The footer is
+/// serialized after every data segment and before the file is finished, so a rejected buffer fails
+/// the write before the file becomes readable. The returned error keeps the flatbuffers error
+/// (for example `TooManyTables`) as its source.
+fn verify_readable<'buf, T: Verifiable + Follow<'buf> + 'buf>(
+    options: &VerifierOptions,
+    name: &'static str,
+    buffer: &'buf [u8],
+) -> VortexResult<()> {
+    root_with_opts::<T>(options, buffer)
+        .map(drop)
+        .map_err(|error| {
+            VortexError::from(error).with_context(format!(
+                "Vortex readers would reject the {name} flatbuffer ({} bytes; limits: {} tables, \
+                 depth {}, apparent size {} bytes)",
+                buffer.len(),
+                options.max_tables,
+                options.max_depth,
+                options.max_apparent_size,
+            ))
+        })
 }
 
 impl From<&PostscriptSegment> for SegmentSpec {
@@ -246,8 +320,9 @@ fn write_flatbuffer<F: FlatBufferRoot + WriteFlatBuffer>(
 
 fn write_buffer(
     offset: &mut u64,
+    out: &mut Segment,
     buffer: ByteBuffer,
-) -> VortexResult<(Vec<ByteBuffer>, PostscriptSegment)> {
+) -> VortexResult<PostscriptSegment> {
     let length = u32::try_from(buffer.len())
         .map_err(|_| vortex_err!("metadata segment length exceeds maximum u32"))?;
     let alignment = buffer.alignment();
@@ -263,11 +338,10 @@ fn write_buffer(
 
     *offset += padding + u64::from(length);
 
-    let mut buffers = Vec::with_capacity(if padding == 0 { 1 } else { 2 });
-    if padding > 0 {
-        buffers.push(ByteBuffer::zeroed(padding as usize));
-    }
-    buffers.push(buffer);
+    out.push_zeros(
+        u32::try_from(padding).map_err(|_| vortex_err!("metadata padding exceeds maximum u32"))?,
+    );
+    out.push_buffer(buffer);
 
-    Ok((buffers, segment))
+    Ok(segment)
 }

@@ -16,6 +16,7 @@ use crate::CompressionSessionExt;
 use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
+use crate::SchemePins;
 use crate::allowed_ids::AllowedIds;
 use crate::schemes::binary;
 use crate::schemes::float;
@@ -137,6 +138,31 @@ pub struct BtrBlocksCompressorBuilder {
     schemes: Vec<&'static dyn Scheme>,
     allowed: AllowedIds,
     mode: CompressionMode,
+    string_dictionary_reuse: bool,
+    pins: Option<&'static SchemePins>,
+}
+
+impl Default for BtrBlocksCompressorBuilder {
+    /// Every built-in scheme except the feature-gated compact schemes, unrestricted, as the
+    /// fork's `ALL_SCHEMES` default was. `with_compact` adds those schemes explicitly.
+    fn default() -> Self {
+        let schemes = crate::CompressionSession::default()
+            .schemes()
+            .iter()
+            .copied()
+            .filter(|scheme| {
+                let name = scheme.id().to_string();
+                !name.contains("zstd") && !name.contains("pco")
+            })
+            .collect();
+        Self {
+            schemes,
+            allowed: AllowedIds::all(),
+            mode: CompressionMode::All,
+            string_dictionary_reuse: false,
+            pins: None,
+        }
+    }
 }
 
 impl BtrBlocksCompressorBuilder {
@@ -148,6 +174,8 @@ impl BtrBlocksCompressorBuilder {
             schemes: session.compression().schemes().to_vec(),
             allowed: AllowedIds::from_session(session),
             mode: CompressionMode::Default,
+            string_dictionary_reuse: false,
+            pins: None,
         }
     }
 
@@ -160,6 +188,8 @@ impl BtrBlocksCompressorBuilder {
             schemes: Vec::new(),
             allowed: AllowedIds::all(),
             mode: CompressionMode::All,
+            string_dictionary_reuse: false,
+            pins: None,
         }
     }
 
@@ -189,6 +219,25 @@ impl BtrBlocksCompressorBuilder {
     /// features.
     pub fn with_compact(mut self) -> Self {
         self.mode = CompressionMode::Compact;
+        #[cfg(feature = "zstd")]
+        {
+            let mut add = |scheme: &'static dyn Scheme| {
+                if !self
+                    .schemes
+                    .iter()
+                    .any(|present| present.id() == scheme.id())
+                {
+                    self.schemes.push(scheme);
+                }
+            };
+            add(&string::ZstdScheme);
+            add(&binary::ZstdScheme);
+            #[cfg(feature = "pco")]
+            {
+                add(&integer::PcoScheme);
+                add(&float::PcoScheme);
+            }
+        }
         self
     }
 
@@ -225,10 +274,38 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Keeps only schemes whose produced encodings are all in `allowed`.
+    pub fn retain_allowed_encodings(mut self, allowed: &HashSet<ArrayId>) -> Self {
+        match &mut self.allowed.registered {
+            Some(registered) => registered.retain(|id| allowed.contains(id)),
+            None => self.allowed.registered = Some(allowed.clone()),
+        }
+        self
+    }
+
+    /// Enables packed Utf8 samples and reuse of existing UInt32 string dictionaries.
+    pub fn with_string_dictionary_reuse(mut self, enabled: bool) -> Self {
+        self.string_dictionary_reuse = enabled;
+        self
+    }
+
+    /// Replays `pins` at the sites they pin instead of searching there; see
+    /// [`CascadingCompressor::with_pins`]. Resolve the table against a compressor built with the
+    /// same schemes.
+    pub fn with_pins(mut self, pins: &'static SchemePins) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`] from the schemes that its preset does not
     /// exclude and whose produced serialized IDs are all allowed.
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.allowed_schemes()))
+        let compressor = CascadingCompressor::new(self.allowed_schemes())
+            .with_string_dictionary_reuse(self.string_dictionary_reuse);
+        BtrBlocksCompressor(match self.pins {
+            Some(pins) => compressor.with_pins(pins),
+            None => compressor,
+        })
     }
 
     fn allowed_schemes(&self) -> Vec<&'static dyn Scheme> {
@@ -253,7 +330,10 @@ mod tests {
     use vortex_array::ArrayId;
     use vortex_array::VTable;
     use vortex_array::arrays::Patched;
+    use vortex_array::arrays::Primitive;
     use vortex_array::arrays::VarBin;
+    use vortex_array::session::ArraySession;
+    use vortex_array::session::ArraySessionExt;
     use vortex_decimal_byte_parts::DecimalByteParts;
     use vortex_decimal_byte_parts::decimal_byte_parts_v1_id;
     use vortex_fastlanes::bitpacked_v1_id;
@@ -268,6 +348,61 @@ mod tests {
 
     static SESSION: LazyLock<VortexSession> =
         LazyLock::new(|| VortexSession::empty().with::<CompressionSession>());
+
+    // Ordered ALL_SCHEMES names at the 0.86.1 fork head 2b1720e9c. Order determines ties.
+    const LEGACY_DEFAULT_SCHEMES: &[&str] = &[
+        "vortex.int.for",
+        "vortex.int.zigzag",
+        "vortex.int.bitpacking",
+        "vortex.int.sparse",
+        "vortex.int.dict",
+        "vortex.int.runend",
+        "vortex.int.sequence",
+        "vortex.int.rle",
+        "vortex.int.delta",
+        "vortex.float.alp",
+        "vortex.float.alprd",
+        "vortex.float.dict",
+        "vortex.float.sparse",
+        "vortex.float.rle",
+        "vortex.string.dict",
+        "vortex.string.fsst",
+        "vortex.string.onpair",
+        "vortex.string.sparse",
+        "vortex.binary.dict",
+        "vortex.binary.varbin",
+        "vortex.decimal.byte_parts",
+        "vortex.ext.temporal",
+    ];
+
+    fn scheme_names(builder: &BtrBlocksCompressorBuilder) -> Vec<&'static str> {
+        builder
+            .allowed_schemes()
+            .iter()
+            .map(|scheme| scheme.scheme_name())
+            .collect()
+    }
+
+    #[test]
+    fn default_matches_0_86_1_scheme_order() {
+        assert_eq!(
+            scheme_names(&BtrBlocksCompressorBuilder::default()),
+            LEGACY_DEFAULT_SCHEMES,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn compact_matches_0_86_1_scheme_order() {
+        let mut expected = LEGACY_DEFAULT_SCHEMES.to_vec();
+        expected.extend(["vortex.string.zstd", "vortex.binary.zstd"]);
+        #[cfg(feature = "pco")]
+        expected.extend(["vortex.int.pco", "vortex.float.pco"]);
+        assert_eq!(
+            scheme_names(&BtrBlocksCompressorBuilder::default().with_compact()),
+            expected,
+        );
+    }
 
     #[rstest]
     #[case::fsst_missing_codes(&string::FSSTScheme, vec![FSST.id()], false)]
@@ -304,6 +439,40 @@ mod tests {
         builder.allowed.editions = Some(allowed.into_iter().collect());
 
         assert_eq!(!builder.allowed_schemes().is_empty(), retained);
+    }
+
+    #[test]
+    fn retain_allowed_encodings_never_reopens_prior_restrictions() {
+        let all_ids: HashSet<_> = CompressionSession::default()
+            .schemes()
+            .iter()
+            .flat_map(|scheme| scheme.produced_encodings())
+            .chain([Primitive.id()])
+            .collect();
+        let empty = HashSet::default();
+        let builder = BtrBlocksCompressorBuilder::default()
+            .retain_allowed_encodings(&empty)
+            .retain_allowed_encodings(&all_ids);
+        assert!(scheme_names(&builder).is_empty());
+
+        let session = VortexSession::empty()
+            .with::<CompressionSession>()
+            .with_some(ArraySession::empty());
+        session.arrays().register(Primitive);
+        // Ignore editions here to isolate the registered-ID restriction of from_session.
+        let restricted = BtrBlocksCompressorBuilder::from_session(&session).disable_editions();
+        assert!(scheme_names(&restricted).is_empty());
+        let retained = restricted.clone().retain_allowed_encodings(&all_ids);
+        assert_eq!(retained.allowed.registered, restricted.allowed.registered);
+        assert_eq!(scheme_names(&retained), scheme_names(&restricted));
+        assert!(
+            scheme_names(
+                &restricted
+                    .retain_allowed_encodings(&empty)
+                    .retain_allowed_encodings(&all_ids)
+            )
+            .is_empty()
+        );
     }
 
     #[test]

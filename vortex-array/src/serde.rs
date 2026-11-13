@@ -4,7 +4,6 @@
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::iter;
 use std::sync::Arc;
 
 use flatbuffers::FlatBufferBuilder;
@@ -13,6 +12,8 @@ use flatbuffers::WIPOffset;
 use flatbuffers::root;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
+use vortex_buffer::segment::Piece;
+use vortex_buffer::segment::Segment;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -52,6 +53,9 @@ pub struct SerializeOptions {
     pub include_padding: bool,
 }
 
+/// Framing capacity a serialized array starts from: its flatbuffer and length usually fit.
+const MIN_FRAMING_CAPACITY: usize = 1024;
+
 impl ArrayRef {
     /// Serialize the array into a sequence of byte buffers that should be written contiguously.
     /// This function returns a vec to avoid copying data buffers.
@@ -63,53 +67,85 @@ impl ArrayRef {
     /// The format of this blob is a sequence of data buffers, possible with prefixed padding,
     /// followed by a flatbuffer containing an [`fba::Array`] message, and ending with a
     /// little-endian u32 describing the length of the flatbuffer message.
+    ///
+    /// [`ArrayRef::serialize_into`] writes the same bytes into an owned [`Segment`].
     pub fn serialize(
         &self,
         ctx: &ArrayContext,
         session: &VortexSession,
         options: &SerializeOptions,
     ) -> VortexResult<Vec<ByteBuffer>> {
+        let mut segment = Segment::new();
+        self.serialize_into(ctx, session, options, &mut segment)?;
+        let alignment = segment.alignment();
+        let parts = segment.into_parts();
+
+        let mut buffers = Vec::with_capacity(parts.pieces.len() + 2);
+        // We push an empty buffer with the maximum alignment, so then subsequent buffers
+        // will be aligned. For subsequent buffers, we always push a 1-byte alignment.
+        buffers.push(ByteBuffer::zeroed_aligned(0, alignment));
+
+        // Every padding run is shorter than the maximum alignment.
+        let zeros = ByteBuffer::zeroed(alignment.as_usize());
+        let framing = ByteBuffer::from(parts.framing);
+        let mut data = parts.buffers.into_iter();
+        for piece in parts.pieces {
+            match piece {
+                Piece::Zeros(len) => buffers.push(zeros.slice(0..len as usize)),
+                Piece::Buffer => buffers.push(
+                    data.next()
+                        .vortex_expect("a buffer piece has a buffer")
+                        .aligned(Alignment::none()),
+                ),
+                Piece::Framing { start, end } => {
+                    // The flatbuffer and its u32 length are separate buffers here.
+                    let length_start = end as usize - size_of::<u32>();
+                    buffers.push(framing.slice(start as usize..length_start));
+                    buffers.push(framing.slice(length_start..end as usize));
+                }
+            }
+        }
+
+        Ok(buffers)
+    }
+
+    /// Serialize the array into `segment`, which must be empty.
+    ///
+    /// The bytes are those of [`ArrayRef::serialize`]: the data buffers with any padding, then
+    /// the [`fba::Array`] flatbuffer and its little-endian u32 length. The data buffers are moved
+    /// into the segment, padding is recorded as a length, and the flatbuffer is built in place in
+    /// the segment's framing storage, which a reused segment brings with it. The segment's
+    /// alignment is the largest alignment among its buffers and the flatbuffer.
+    pub fn serialize_into(
+        &self,
+        ctx: &ArrayContext,
+        session: &VortexSession,
+        options: &SerializeOptions,
+        segment: &mut Segment,
+    ) -> VortexResult<()> {
+        debug_assert!(segment.is_empty(), "serialize_into needs an empty segment");
+
         // Resolve the wire representation once. Serializers may choose historical IDs and may
         // provide downgraded buffers or children that differ from the in-memory array tree.
         let root = ArrayNodeFlatBuffer::try_new(ctx, session, self)?;
-        let array_buffers = root.array.buffers();
 
-        // Allocate result buffers, including a possible padding buffer for each.
-        let mut buffers = vec![];
-        let mut fb_buffers = Vec::with_capacity(buffers.capacity());
-
-        // If we're including padding, we need to find the maximum required buffer alignment.
-        let max_alignment = array_buffers
-            .iter()
-            .map(|buf| buf.alignment())
-            .chain(iter::once(FlatBuffer::alignment()))
-            .max()
-            .unwrap_or_else(FlatBuffer::alignment);
-
-        // Create a shared buffer of zeros we can use for padding
-        let zeros = ByteBuffer::zeroed(max_alignment.as_usize());
-
-        // We push an empty buffer with the maximum alignment, so then subsequent buffers
-        // will be aligned. For subsequent buffers, we always push a 1-byte alignment.
-        buffers.push(ByteBuffer::zeroed_aligned(0, max_alignment));
+        let mut descriptors = Vec::with_capacity(root.array.nbuffers_recursive());
+        let mut max_alignment = FlatBuffer::alignment();
 
         // Keep track of where we are in the "file" to calculate padding.
         let mut pos = options.offset;
 
-        // Push all the array buffers with padding as necessary.
-        for buffer in array_buffers {
+        root.array.visit_buffers(&mut |buffer| {
+            max_alignment = max_alignment.max(buffer.alignment());
             let padding = if options.include_padding {
                 let padding = pos.next_multiple_of(buffer.alignment().as_usize()) - pos;
-                if padding > 0 {
-                    pos += padding;
-                    buffers.push(zeros.slice(0..padding));
-                }
+                pos += padding;
                 padding
             } else {
                 0
             };
 
-            fb_buffers.push(fba::Buffer::new(
+            descriptors.push(fba::Buffer::new(
                 u16::try_from(padding).vortex_expect("padding fits into u16"),
                 buffer.alignment().exponent(),
                 Compression::None,
@@ -118,15 +154,21 @@ impl ArrayRef {
             ));
 
             pos += buffer.len();
-            buffers.push(buffer.aligned(Alignment::none()));
-        }
+            Ok(())
+        })?;
 
-        // Set up the flatbuffer builder
-        let mut fbb = FlatBufferBuilder::new();
+        // Build the flatbuffer from the back of the segment's framing storage. The builder relies
+        // on zeroed storage for its own padding, and room is left for the length that follows.
+        let mut framing = segment.take_framing();
+        // Start from room for a typical array's flatbuffer, so the builder does not grow from
+        // nothing by doubling. The bytes it builds do not depend on where it starts.
+        framing.reserve(MIN_FRAMING_CAPACITY);
+        framing.resize(framing.capacity().saturating_sub(size_of::<u32>()), 0);
+        let mut fbb = FlatBufferBuilder::from_vec(framing);
 
         let fb_root = root.try_write_flatbuffer(&mut fbb)?;
 
-        let fb_buffers = fbb.create_vector(&fb_buffers);
+        let fb_buffers = fbb.create_vector(&descriptors);
         let fb_array = fba::Array::create(
             &mut fbb,
             &fba::ArrayArgs {
@@ -135,29 +177,43 @@ impl ArrayRef {
             },
         );
         fbb.finish_minimal(fb_array);
-        let (fb_vec, fb_start) = fbb.collapse();
-        let fb_end = fb_vec.len();
-        let fb_buffer = ByteBuffer::from(fb_vec).slice(fb_start..fb_end);
-        let fb_length = fb_buffer.len();
+        let (mut framing, fb_start) = fbb.collapse();
+
+        // Finally, we write down the u32 length for the flatbuffer.
+        let fb_length = u32::try_from(framing.len() - fb_start)
+            .map_err(|_| vortex_err!("Array metadata flatbuffer must fit into u32 for serialization. Array encoding tree is too large."))?;
+        framing.extend_from_slice(&fb_length.to_le_bytes());
+
+        // Move the data buffers into the segment, each after its padding.
+        let mut descriptors = descriptors.iter();
+        root.array.into_buffers(&mut |buffer| {
+            let descriptor = descriptors
+                .next()
+                .vortex_expect("every buffer has a descriptor");
+            segment.push_zeros(u32::from(descriptor.padding()));
+            segment.push_buffer(buffer);
+        });
 
         if options.include_padding {
             let padding = pos.next_multiple_of(FlatBuffer::alignment().as_usize()) - pos;
-            if padding > 0 {
-                buffers.push(zeros.slice(0..padding));
-            }
+            segment.push_zeros(u32::try_from(padding).vortex_expect("padding fits into u32"));
         }
-        buffers.push(fb_buffer);
+        let framing_len = framing.len();
+        segment.put_framing(framing, fb_start..framing_len);
+        segment.set_alignment(max_alignment);
 
-        // Finally, we write down the u32 length for the flatbuffer.
-        buffers.push(ByteBuffer::from(
-            u32::try_from(fb_length)
-                .map_err(|_| vortex_err!("Array metadata flatbuffer must fit into u32 for serialization. Array encoding tree is too large."))?
-                .to_le_bytes()
-                .to_vec(),
-        ));
-
-        Ok(buffers)
+        Ok(())
     }
+}
+
+/// The [`fba::Array`] flatbuffer of a segment written by [`ArrayRef::serialize_into`], without
+/// its trailing length.
+pub fn array_flatbuffer(segment: &Segment) -> Option<&[u8]> {
+    let Some(&Piece::Framing { start, end }) = segment.piece_list().last() else {
+        return None;
+    };
+    let end = (end as usize).checked_sub(size_of::<u32>())?;
+    segment.framing().get(start as usize..end)
 }
 
 #[derive(Clone, Debug)]
@@ -201,16 +257,27 @@ impl ArraySerializationTree {
                 .sum::<usize>()
     }
 
-    fn buffers(&self) -> Vec<ByteBuffer> {
-        let mut buffers = Vec::with_capacity(self.nbuffers_recursive());
-        self.append_buffers(&mut buffers);
-        buffers
+    /// Visit every buffer of the tree in serialized order.
+    fn visit_buffers<'s>(
+        &'s self,
+        visit: &mut impl FnMut(&'s ByteBuffer) -> VortexResult<()>,
+    ) -> VortexResult<()> {
+        for buffer in &self.buffers {
+            visit(buffer)?;
+        }
+        for child in &self.children {
+            child.visit_buffers(visit)?;
+        }
+        Ok(())
     }
 
-    fn append_buffers(&self, buffers: &mut Vec<ByteBuffer>) {
-        buffers.extend(self.buffers.iter().cloned());
-        for child in &self.children {
-            child.append_buffers(buffers);
+    /// Move every buffer of the tree out, in serialized order.
+    fn into_buffers(self, out: &mut impl FnMut(ByteBuffer)) {
+        for buffer in self.buffers {
+            out(buffer);
+        }
+        for child in self.children {
+            child.into_buffers(out);
         }
     }
 }

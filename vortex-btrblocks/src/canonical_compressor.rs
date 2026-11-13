@@ -45,6 +45,12 @@ pub struct BtrBlocksCompressor(
     pub CascadingCompressor,
 );
 
+impl Default for BtrBlocksCompressor {
+    fn default() -> Self {
+        BtrBlocksCompressorBuilder::default().build()
+    }
+}
+
 impl BtrBlocksCompressor {
     /// Creates a compressor with the schemes registered in the session's
     /// [`CompressionSession`](crate::CompressionSession), keeping only those whose produced

@@ -68,6 +68,7 @@ mod dispatch;
 mod macros;
 #[cfg(feature = "memmap2")]
 mod memmap2;
+pub mod segment;
 #[cfg(feature = "serde")]
 mod serde;
 mod string;

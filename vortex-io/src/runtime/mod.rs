@@ -78,6 +78,20 @@ pub trait Executor: Send + Sync {
     /// The returned `AbortHandle` may be used to optimistically cancel the task if it has not
     /// yet started executing.
     fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
+
+    /// Whether work Vortex hands off only so that a waiting caller makes progress, such as a
+    /// file's read driver, a scan's preparation or its split tasks, should instead run inside that
+    /// caller's poll.
+    ///
+    /// An executor whose work is owned and polled by one task, such as a job on a thread-per-core
+    /// worker, returns `true`: readers then poll the read driver while they wait, and a scan
+    /// stream prepares its scan and polls its splits in place, so a scan over resident segments
+    /// completes in one poll and nothing needs a second task. Other CPU work offered through
+    /// [`Executor::spawn_cpu`], such as compressing chunks on write, is unaffected. By default
+    /// such work is spawned.
+    fn run_inline(&self) -> bool {
+        false
+    }
 }
 
 /// A handle that may be used to optimistically abort a spawned task.

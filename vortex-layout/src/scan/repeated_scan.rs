@@ -29,6 +29,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::runtime::BlockingRuntime;
+use vortex_io::runtime::Handle;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::row_mask::RowMask;
 use vortex_scan::selection::Selection;
@@ -246,13 +247,16 @@ impl<A: 'static + Send> RepeatedScan<A> {
         let ctx = self.task_context();
 
         let map_fn = &self.map_fn;
+        // Inline, the stream polls each split in place of a spawned task.
+        let inline = handle.run_inline();
 
         let arrays = match self.limit.as_ref().map(ScanLimit::budget) {
             // With a filter, a split's output row count is unknown until its filter has run.
             // Splits therefore filter and project ahead of the consumer, and the rows they
             // return are taken from the limit as they are emitted, discarding the excess. Split
             // tasks are built lazily so that no new splits start once the budget is spent. The
-            // map function needs the trimmed arrays, so it runs in a second stage of CPU tasks.
+            // map function needs the trimmed arrays, so it runs in a second stage, in the caller
+            // for inline scans and in CPU tasks otherwise.
             Some(limit) if ctx.filter.is_some() => {
                 let gate = limit.clone();
                 let selection = self.selection.clone();
@@ -262,21 +266,34 @@ impl<A: 'static + Send> RepeatedScan<A> {
                     .map(move |row_range| {
                         let ctx = Arc::clone(&ctx);
                         let selection = selection.clone();
-                        split_handle.spawn_nested(move |handle| async move {
-                            let task = handle
-                                .spawn_cpu(move || {
+                        let run = move |handle: Handle| {
+                            let ctx = Arc::clone(&ctx);
+                            let selection = selection.clone();
+                            let row_range = row_range.clone();
+                            async move {
+                                let build = move || {
                                     let row_mask = selection.row_mask(&row_range);
                                     if row_mask.mask().all_false() {
                                         return Ok(None);
                                     }
                                     split_exec(&ctx, row_mask).map(Some)
-                                })
-                                .await?;
-                            match task {
-                                Some(task) => task.await,
-                                None => Ok(None),
+                                };
+                                let task = if handle.run_inline() {
+                                    build()?
+                                } else {
+                                    handle.spawn_cpu(build).await?
+                                };
+                                match task {
+                                    Some(task) => task.await,
+                                    None => Ok(None),
+                                }
                             }
-                        })
+                        };
+                        if split_handle.run_inline() {
+                            future::Either::Left(run(split_handle.clone()))
+                        } else {
+                            future::Either::Right(split_handle.spawn_nested(run))
+                        }
                     });
                 let map_fn = Arc::clone(map_fn);
                 let arrays = buffer(tasks, ordered, concurrency)
@@ -284,7 +301,11 @@ impl<A: 'static + Send> RepeatedScan<A> {
                     .boxed();
                 let mapped = limit_rows(arrays, limit).map(move |array| {
                     let map_fn = Arc::clone(&map_fn);
-                    handle.spawn_cpu(move || map_fn(array?))
+                    if inline {
+                        future::Either::Left(future::ready(array.and_then(|array| map_fn(array))))
+                    } else {
+                        future::Either::Right(handle.spawn_cpu(move || map_fn(array?)))
+                    }
                 });
                 buffer(mapped, ordered, concurrency)
             }
@@ -305,7 +326,13 @@ impl<A: 'static + Send> RepeatedScan<A> {
                     tasks.push(map_split(task, map_fn));
                 }
                 buffer(
-                    stream::iter(tasks).map(move |task| handle.spawn(task)),
+                    stream::iter(tasks).map(move |task| {
+                        if inline {
+                            future::Either::Left(task)
+                        } else {
+                            future::Either::Right(handle.spawn(task))
+                        }
+                    }),
                     ordered,
                     concurrency,
                 )

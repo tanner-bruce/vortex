@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use vortex_buffer::ByteBuffer;
+use vortex_buffer::segment::Segment;
 use vortex_error::VortexResult;
 
 use crate::segments::SegmentId;
@@ -20,7 +20,16 @@ pub type SegmentSinkRef = Arc<dyn SegmentSink>;
 /// backend. The [`SequenceId`] argument lets sinks serialize id assignment while still allowing
 /// upstream layout strategies to do work concurrently.
 pub trait SegmentSink: Send + Sync {
-    /// Write the given data into a segment, ordered based on the provided sequence identifier.
+    /// An empty segment for a writer to serialize into. A sink may hand out storage from
+    /// segments it has finished with.
+    fn new_segment(&self) -> Segment {
+        Segment::new()
+    }
+
+    /// Write the given segment, ordered based on the provided sequence identifier.
+    ///
+    /// The segment's [`alignment`](Segment::alignment) is the alignment its body needs. A sink
+    /// that writes segments contiguously sets [`Segment::leading_zeros`] to reach it.
     ///
     /// Implementations of this trait should call [`SequenceId::collapse`] on the provided
     /// `sequence_id` if they need to ensure that the segment IDs are monotonically increasing.
@@ -30,9 +39,5 @@ pub trait SegmentSink: Send + Sync {
     /// If they do not require ordered segment IDs, for example if segments are stored in
     /// random-access key/values storage, then the sequence ID can be dropped and the segment
     /// written immediately.
-    async fn write(
-        &self,
-        sequence_id: SequenceId,
-        buffers: Vec<ByteBuffer>,
-    ) -> VortexResult<SegmentId>;
+    async fn write(&self, sequence_id: SequenceId, segment: Segment) -> VortexResult<SegmentId>;
 }

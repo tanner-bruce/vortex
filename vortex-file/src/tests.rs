@@ -3,14 +3,18 @@
 
 #![expect(clippy::cast_possible_truncation)]
 use std::fs;
+use std::future::ready;
 use std::iter;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::oneshot;
 use futures::pin_mut;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -126,7 +130,9 @@ use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
 use crate::flatbuffers::footer as fb;
 use crate::footer::SegmentSpec;
-static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+static SESSION: LazyLock<VortexSession> = LazyLock::new(new_session);
+
+fn new_session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
@@ -135,7 +141,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     crate::enable_all_registered_array_encodings(&session);
 
     session
-});
+}
 
 fn pruning_aggregate_fns() -> Vec<AggregateFnRef> {
     [Stat::Min, Stat::Max, Stat::NullCount, Stat::NaNCount]
@@ -2051,15 +2057,54 @@ async fn test_writer_buffered_bytes(
     let mut buf = ByteBufferMut::empty();
     let options = SESSION.write_options().with_strategy(Arc::clone(&strategy));
     let buffered_bytes = options.buffered_bytes_tracker();
-    let mut writer = options.writer(&mut buf, array.dtype().clone());
+    let dtype = array.dtype().clone();
+    let mut writer = options.writer(&mut buf, dtype.clone());
 
     assert_eq!(writer.buffered_bytes(), 0);
 
-    // The third push forces two chunks through the capacity-one input channel while keeping the
-    // writer open. Each physical leaf retains two BUFFER_SIZE chunks while peeking for more input.
-    writer.push(array.clone()).await?;
-    writer.push(array.clone()).await?;
-    writer.push(array).await?;
+    // The writer runs on the caller's task, so it moves only while a push or `finish` polls it,
+    // and a push returns as soon as its chunk is in the input channel. So push three chunks as
+    // one stream that then stays open, and keep polling the writer until it waits for a fourth.
+    // Each physical leaf then retains two BUFFER_SIZE chunks while peeking for more input, and
+    // never more on the way there.
+    let (release, released) = oneshot::channel::<()>();
+    let held_open = futures::stream::once(async move {
+        let _ = released.await;
+    })
+    .filter_map(|()| ready(None));
+    let chunks =
+        futures::stream::iter([array.clone(), array.clone(), array].map(Ok)).chain(held_open);
+    let settle = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let buffered = buffered_bytes.buffered_bytes();
+            assert!(
+                buffered <= expected_buffered_bytes,
+                "{buffered} bytes buffered"
+            );
+            if buffered == expected_buffered_bytes {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the writer did not settle: {buffered} bytes buffered"
+            );
+            tokio::task::yield_now().await;
+        }
+        // Settled: more polls change nothing.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            assert_eq!(buffered_bytes.buffered_bytes(), expected_buffered_bytes);
+        }
+        let _ = release.send(());
+    };
+    let (pushed, ()) = futures::join!(
+        writer.push_stream(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            dtype, chunks
+        ))),
+        settle
+    );
+    pushed?;
 
     assert_eq!(writer.buffered_bytes(), expected_buffered_bytes);
 
@@ -2085,23 +2130,62 @@ async fn test_buffered_bytes_are_writer_scoped() -> VortexResult<()> {
         leaf,
     ));
 
+    let first_options = SESSION.write_options().with_strategy(Arc::clone(&strategy));
+    let first_tracker = first_options.buffered_bytes_tracker();
     let mut first_buf = ByteBufferMut::empty();
-    let mut first = SESSION
-        .write_options()
-        .with_strategy(Arc::clone(&strategy))
-        .writer(&mut first_buf, array.dtype().clone());
+    let mut first = first_options.writer(&mut first_buf, array.dtype().clone());
+    let second_options = SESSION.write_options().with_strategy(strategy);
+    let second_tracker = second_options.buffered_bytes_tracker();
     let mut second_buf = ByteBufferMut::empty();
-    let mut second = SESSION
-        .write_options()
-        .with_strategy(strategy)
-        .writer(&mut second_buf, array.dtype().clone());
+    let mut second = second_options.writer(&mut second_buf, array.dtype().clone());
 
-    first.push(array.clone()).await?;
-    first.push(array.clone()).await?;
-    first.push(array.clone()).await?;
-    second.push(array.clone()).await?;
-    second.push(array.clone()).await?;
-    second.push(array).await?;
+    // The writer runs on the caller's task, so it moves only while a push polls it. Push three
+    // chunks as one stream that then stays open, and keep polling both writers until each leaf
+    // retains two chunks while it peeks for a fourth.
+    let (release, released) = oneshot::channel::<()>();
+    let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+    let chunks = || {
+        let released = Arc::clone(&released);
+        let held_open = futures::stream::once(async move {
+            if let Some(released) = released.lock().await.take() {
+                let _ = released.await;
+            }
+        })
+        .filter_map(|()| ready(None));
+        ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            array.dtype().clone(),
+            futures::stream::iter([array.clone(), array.clone(), array.clone()].map(Ok))
+                .chain(held_open),
+        ))
+    };
+    let settle = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let buffered = [
+                first_tracker.buffered_bytes(),
+                second_tracker.buffered_bytes(),
+            ];
+            for buffered in buffered {
+                assert!(buffered <= 2 * BUFFER_SIZE, "{buffered} bytes buffered");
+            }
+            if buffered == [2 * BUFFER_SIZE, 2 * BUFFER_SIZE] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the writers did not settle: {buffered:?} bytes buffered"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(release);
+    };
+    let (first_pushed, second_pushed, ()) = futures::join!(
+        first.push_stream(chunks()),
+        second.push_stream(chunks()),
+        settle
+    );
+    first_pushed?;
+    second_pushed?;
 
     assert_eq!(first.buffered_bytes(), 2 * BUFFER_SIZE);
     assert_eq!(second.buffered_bytes(), 2 * BUFFER_SIZE);
@@ -3476,4 +3560,92 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
 
     assert_arrays_eq!(result, mk_struct(vec![big])?, &mut ctx);
     Ok(())
+}
+
+/// Refuses to spawn futures or CPU work, as a thread-per-core job's executor would for work that
+/// must stay in the caller's poll; readers and scans must then run inline.
+struct InlineExecutor;
+
+impl vortex_io::runtime::Executor for InlineExecutor {
+    fn spawn(
+        &self,
+        _fut: futures::future::BoxFuture<'static, ()>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        panic!("an inline executor spawned a future")
+    }
+
+    fn spawn_cpu(
+        &self,
+        _task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        panic!("an inline scan offered its preparation as a CPU task")
+    }
+
+    fn spawn_blocking_io(
+        &self,
+        _task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> vortex_io::runtime::AbortHandleRef {
+        panic!("an inline executor spawned blocking I/O")
+    }
+
+    fn run_inline(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn file_reads_and_scans_run_inline_without_spawning() {
+    use vortex_io::runtime::Handle;
+    use vortex_io::session::RuntimeSessionExt;
+
+    let numbers = ChunkedArray::from_iter([
+        buffer![1u32, 2, 3, 4].into_array(),
+        buffer![5u32, 6, 7, 8].into_array(),
+    ])
+    .into_array();
+    let st = StructArray::from_fields(&[("numbers", numbers)]).unwrap();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.into_array().to_array_stream())
+        .await
+        .unwrap();
+    let buffer = buf.freeze();
+
+    // No Tokio context on this thread: every read and split is polled by the scan's consumer.
+    std::thread::spawn(move || {
+        let executor: Arc<dyn vortex_io::runtime::Executor> = Arc::new(InlineExecutor);
+        // A session of its own: a clone of `SESSION` would share the handle it installs.
+        let session = new_session().with_handle(Handle::new(Arc::downgrade(&executor)));
+        let rows = futures::executor::block_on(async {
+            let file = session.open_options().open_read(buffer).await.unwrap();
+            let stream = file.scan().unwrap().into_array_stream().unwrap();
+            pin_mut!(stream);
+            let mut rows = 0;
+            while let Some(array) = stream.next().await {
+                rows += array.unwrap().len();
+            }
+            let filtered = file
+                .scan()
+                .unwrap()
+                .with_projection(bind_scan_expr(&file, col("numbers")))
+                .with_filter(bind_scan_expr(&file, gt(col("numbers"), lit(3_u32))))
+                .with_limit(1)
+                .into_array_stream()
+                .unwrap()
+                .read_all()
+                .await
+                .unwrap();
+            assert_arrays_eq!(
+                filtered,
+                buffer![4_u32].into_array(),
+                &mut session.create_execution_ctx()
+            );
+            rows
+        });
+        assert_eq!(rows, 8);
+    })
+    .join()
+    .unwrap();
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::future::poll_fn;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -13,9 +14,11 @@ use async_channel::bounded;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::mpsc;
 use futures::future::Fuse;
 use futures::future::LocalBoxFuture;
 use futures::future::ready;
+use futures::future::try_join;
 use futures::pin_mut;
 use futures::select;
 use itertools::Itertools;
@@ -44,14 +47,24 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_io::IoBuf;
+use vortex_io::Segment;
+use vortex_io::SegmentWrite;
 use vortex_io::VortexWrite;
 use vortex_io::runtime::BlockingRuntime;
-use vortex_io::session::RuntimeSessionExt;
+use vortex_io::write_segment_to;
+use vortex_layout::BufferedBytesReservation;
 use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
+use vortex_layout::LayoutRef;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutWriterContext;
 use vortex_layout::layouts::file_stats::accumulate_stats;
+use vortex_layout::layouts::stitch::RangeLayout;
+use vortex_layout::layouts::stitch::stitch_range_layouts;
+use vortex_layout::layouts::zoned::writer::DeferredZones;
+use vortex_layout::layouts::zoned::writer::ZoneDeferral;
+use vortex_layout::segments::SegmentId;
+use vortex_layout::segments::SegmentSink;
 use vortex_layout::sequence::SequenceId;
 use vortex_layout::sequence::SequentialStreamAdapter;
 use vortex_layout::sequence::SequentialStreamExt;
@@ -69,6 +82,7 @@ use crate::counting::CountingVortexWrite;
 use crate::footer::FileStatistics;
 use crate::footer::MAX_METADATA_KEY_BYTES;
 use crate::footer::MAX_METADATA_SEGMENTS;
+use crate::footer::SegmentSpec;
 use crate::segments::writer::BufferedSegmentSink;
 
 /// Configure a new writer, which can eventually be used to write an [`ArrayStream`] into a sink
@@ -264,41 +278,34 @@ impl VortexWriteOptions {
         write: W,
         stream: S,
     ) -> VortexResult<WriteSummary> {
-        self.write_internal(write, ArrayStreamExt::boxed(stream))
+        self.write_internal(WriteOutput(write), ArrayStreamExt::boxed(stream))
             .await
     }
 
-    async fn write_internal<W: VortexWrite + Unpin>(
+    /// Write an [`ArrayStream`] as a Vortex file into a sink that takes whole segments.
+    ///
+    /// The file magic, each data segment and the footer arrive in their own
+    /// [`SegmentWrite::write_segment`], in file order, and the bytes are those [`Self::write`]
+    /// produces. The writer waits on [`SegmentWrite::poll_credit`] before each segment, and
+    /// reuses the segments the sink hands back.
+    pub async fn write_segments<W: SegmentWrite + Send + Unpin, S: ArrayStream + Send + 'static>(
         self,
-        mut write: W,
+        sink: W,
+        stream: S,
+    ) -> VortexResult<WriteSummary> {
+        self.write_internal(SegmentWriteOutput(sink), ArrayStreamExt::boxed(stream))
+            .await
+    }
+
+    async fn write_internal<O: SegmentOutput>(
+        self,
+        mut output: O,
         stream: SendableArrayStream,
     ) -> VortexResult<WriteSummary> {
         validate_metadata_segments(&self.metadata)?;
 
         let enforce_editions = !self.disable_editions;
-        // The array context is built here, rather than when the options were constructed, so that
-        // encodings registered on the session in between are still eligible for the file.
-        let array_ctx = new_array_context(&self.session, enforce_editions);
-        let ctx = LayoutWriterContext::new(array_ctx)
-            .with_buffered_bytes_tracker(self.buffered_bytes.clone());
-        let ctx = if enforce_editions {
-            ctx.with_allowed_aggregates(edition_filter(&self.session, ComponentKind::Aggregate))
-                .with_allowed_layouts(edition_filter(&self.session, ComponentKind::Layout))
-        } else {
-            ctx
-        };
-        let strategy = match self.strategy {
-            Some(strategy) => strategy,
-            None => {
-                let mut compressor = BtrBlocksCompressorBuilder::from_session(&self.session);
-                if !enforce_editions {
-                    compressor = compressor.disable_editions();
-                }
-                WriteStrategyBuilder::from_session(&self.session)
-                    .with_btrblocks_builder(compressor)
-                    .build()
-            }
-        };
+        let (ctx, strategy) = self.layout_setup(enforce_editions);
         let dtype = stream.dtype().clone();
         if enforce_editions {
             validate_dtype_editions(&self.session, &dtype)?;
@@ -329,67 +336,82 @@ impl VortexWriteOptions {
         let write_nested_statistics =
             self.write_nested_statistics && ctx.allows_aggregate(&Min.id());
 
-        let (file_stats, stream) = accumulate_stats(
-            stream,
-            file_statistics,
-            &self.session,
-            write_nested_statistics,
-            self.write_legacy_statistics,
-            &ctx,
-        )?;
+        // A write that records no file statistics must not pass its input through the
+        // statistics fan-out: that stage prefetches up to the machine's parallelism, which
+        // retains input chunks a stalled output would otherwise hold back.
+        let (file_stats, stream) = if omit_statistics {
+            (None, stream)
+        } else {
+            let (stats, stream) = accumulate_stats(
+                stream,
+                file_statistics,
+                &self.session,
+                write_nested_statistics,
+                self.write_legacy_statistics,
+                &ctx,
+            )?;
+            (Some(stats), stream)
+        };
 
         // First, write the magic bytes.
-        write.write_all(ByteBuffer::copy_from(MAGIC_BYTES)).await?;
+        let mut magic = Segment::new();
+        magic.push_framing_bytes(&MAGIC_BYTES);
+        output.write(magic).await?;
         let mut position = MAGIC_BYTES.len() as u64;
 
-        // Create a channel to send buffers from the segment sink to the output stream.
-        let (send, recv_stream) = bounded(1);
+        // Create a rendezvous channel to send segments from the segment sink to the output
+        // stream. It holds no segment of its own: while the output writes one segment, the sink
+        // holds at most the next, so a stalled output retains no more input than when the channel
+        // carried buffers.
+        let (send, recv_stream) = mpsc::channel(0);
 
         let segments = Arc::new(BufferedSegmentSink::new(send, position));
+        let recycle = segments.recycler();
 
-        // We spawn the layout future so it is driven in the background while we write the
-        // buffer stream, so we don't need to poll it until all buffers have been drained.
+        // The layout future is joined with the drain below, so the whole write is one future that
+        // runs on the caller's task. The layout future owns the sink, and with it the channel's
+        // sender, so the drain ends when the layout is written.
         let ctx2 = ctx.clone();
-        let session = self.session.clone();
-        let layout_fut = self.session.handle().spawn_nested(move |_| async move {
+        let session = &self.session;
+        let layout_fut = async move {
             let layout = strategy
                 .write_stream(
                     ctx2,
                     Arc::<BufferedSegmentSink>::clone(&segments),
                     stream,
                     eof,
-                    &session,
+                    session,
                 )
                 .await?;
             Ok::<_, VortexError>((layout, segments.segment_specs()))
-        });
+        };
 
-        // Flush buffers as they arrive
-        pin_mut!(recv_stream);
-        while let Some(buffer) = recv_stream.next().await {
-            if buffer.is_empty() {
-                continue;
+        // Flush segments as they arrive, and keep the ones the output hands back for reuse.
+        let drain_fut = async {
+            pin_mut!(recv_stream);
+            while let Some(segment) = recv_stream.next().await {
+                position += segment.padded_len();
+                if let Some(returned) = output.write(segment).await? {
+                    recycle.recycle(returned);
+                }
             }
-            position += buffer.len() as u64;
-            write.write_all(buffer).await?;
-        }
+            Ok::<_, VortexError>(())
+        };
 
-        let (layout, segment_specs) = layout_fut.await?;
+        let ((layout, segment_specs), ()) = try_join(layout_fut, drain_fut).await?;
 
         // Assemble the Footer object now that we have all the segments.
-        let statistics = if omit_statistics {
-            None
-        } else if write_nested_statistics {
-            Some(FileStatistics::new_with_dtype(
+        let statistics = match file_stats {
+            None => None,
+            Some(file_stats) if write_nested_statistics => Some(FileStatistics::new_with_dtype(
                 file_stats.aggregate_stats()?.into(),
                 file_stats.legacy_aggregate_stats()?.into(),
                 &dtype,
-            ))
-        } else {
-            Some(FileStatistics::new_legacy_only(
+            )),
+            Some(file_stats) => Some(FileStatistics::new_legacy_only(
                 file_stats.legacy_aggregate_stats()?.into(),
                 &dtype,
-            ))
+            )),
         };
         let mut footer = Footer::new(
             Arc::clone(&layout),
@@ -399,7 +421,7 @@ impl VortexWriteOptions {
         );
 
         // Emit the footer buffers and EOF.
-        let (footer_buffers, metadata, approx_byte_size) = footer
+        let (footer_segment, metadata, approx_byte_size) = footer
             .clone()
             .into_serializer(&self.session)
             .with_layout_context(new_layout_context(&self.session, enforce_editions))
@@ -411,17 +433,157 @@ impl VortexWriteOptions {
             .with_metadata_segments(metadata)
             .with_approx_byte_size(approx_byte_size);
 
-        for buffer in footer_buffers {
-            position += buffer.len() as u64;
-            write.write_all(buffer).await?;
-        }
+        position += footer_segment.padded_len();
+        output.write(footer_segment).await?;
 
-        write.flush().await?;
+        output.flush().await?;
 
         Ok(WriteSummary {
             footer,
             size: position,
         })
+    }
+
+    /// Write a run of whole zones of a file, to be joined with the runs around it by
+    /// [`Self::write_stitched`].
+    ///
+    /// The stream must start and end on zone boundaries of the file's zoned strategies. The
+    /// range keeps its segments in memory, numbered from 0, and defers every zone map. Each kept
+    /// segment counts on [`Self::buffered_bytes_tracker`] until a stitched write places it. The
+    /// file options must not ask for file statistics, which would need every range's rows.
+    pub async fn write_range<S: ArrayStream + Send + 'static>(
+        self,
+        stream: S,
+    ) -> VortexResult<RangeWrite> {
+        if self
+            .file_statistics
+            .as_ref()
+            .is_some_and(|stats| !stats.is_empty())
+        {
+            vortex_bail!("a range write cannot record file statistics");
+        }
+        let enforce_editions = !self.disable_editions;
+        let (ctx, strategy) = self.layout_setup(enforce_editions);
+        let deferral = ZoneDeferral::default();
+        let ctx = ctx.with_zone_deferral(deferral.clone());
+        let dtype = stream.dtype().clone();
+        if enforce_editions {
+            validate_dtype_editions(&self.session, &dtype)?;
+        }
+        let (mut ptr, eof) = SequenceId::root().split();
+        let stream = SequentialStreamAdapter::new(
+            dtype.clone(),
+            stream
+                .try_filter(|chunk| ready(!chunk.is_empty()))
+                .map(move |result| result.map(|chunk| (ptr.advance(), chunk))),
+        )
+        .sendable();
+        let sink = Arc::new(RangeSegmentSink {
+            segments: parking_lot::Mutex::default(),
+            tracker: self.buffered_bytes.clone(),
+        });
+        let layout = strategy
+            .write_stream(
+                ctx.clone(),
+                Arc::<RangeSegmentSink>::clone(&sink),
+                stream,
+                eof,
+                &self.session,
+            )
+            .await?;
+        let segments = std::mem::take(&mut *sink.segments.lock());
+        Ok(RangeWrite {
+            layout,
+            segments,
+            zones: deferral.take(),
+            array_ids: ctx.array_ctx().to_ids(),
+        })
+    }
+
+    /// Write consecutive [`RangeWrite`]s as one Vortex file, with the bytes a single
+    /// [`Self::write`] of all their rows produces.
+    ///
+    /// Each range's segments are placed after the ones before it, padding is recomputed at
+    /// each final offset, the zone tables are built from the ranges' partials, and the footer
+    /// describes the joined tree.
+    pub async fn write_stitched<W: VortexWrite + Unpin>(
+        self,
+        write: W,
+        ranges: Vec<RangeWrite>,
+    ) -> VortexResult<WriteSummary> {
+        let mut stitched = self.begin_stitched(write).await?;
+        for range in ranges {
+            stitched.push(range).await?;
+        }
+        stitched.finish().await
+    }
+
+    /// Start a stitched write: the file magic goes out now, each range's segments when it is
+    /// [pushed](StitchedWriter::push), and the zone tables and footer at
+    /// [finish](StitchedWriter::finish). An earlier range can be written while later ones are
+    /// still being encoded.
+    pub async fn begin_stitched<W: VortexWrite + Unpin>(
+        self,
+        write: W,
+    ) -> VortexResult<StitchedWriter<W>> {
+        validate_metadata_segments(&self.metadata)?;
+        if self
+            .file_statistics
+            .as_ref()
+            .is_some_and(|stats| !stats.is_empty())
+        {
+            vortex_bail!("a stitched write cannot record file statistics");
+        }
+        let enforce_editions = !self.disable_editions;
+        let (ctx, _) = self.layout_setup(enforce_editions);
+        let array_ids = ctx.array_ctx().to_ids();
+        let mut output = WriteOutput(write);
+        let mut magic = Segment::new();
+        magic.push_framing_bytes(&MAGIC_BYTES);
+        output.write(magic).await?;
+        Ok(StitchedWriter {
+            options: self,
+            output,
+            ctx,
+            array_ids,
+            sink: Arc::new(StitchSegmentSink::new(MAGIC_BYTES.len() as u64)),
+            layouts: Vec::new(),
+            enforce_editions,
+        })
+    }
+
+    /// The writer context and strategy a write of this file uses.
+    ///
+    /// The array context is built here, rather than when the options were constructed, so that
+    /// encodings registered on the session in between are still eligible for the file.
+    fn layout_setup(
+        &self,
+        enforce_editions: bool,
+    ) -> (LayoutWriterContext, Arc<dyn LayoutStrategy>) {
+        // The array context is built here, rather than when the options were constructed, so that
+        // encodings registered on the session in between are still eligible for the file.
+        let array_ctx = new_array_context(&self.session, enforce_editions);
+        let ctx = LayoutWriterContext::new(array_ctx)
+            .with_buffered_bytes_tracker(self.buffered_bytes.clone());
+        let ctx = if enforce_editions {
+            ctx.with_allowed_aggregates(edition_filter(&self.session, ComponentKind::Aggregate))
+                .with_allowed_layouts(edition_filter(&self.session, ComponentKind::Layout))
+        } else {
+            ctx
+        };
+        let strategy = match &self.strategy {
+            Some(strategy) => Arc::clone(strategy),
+            None => {
+                let mut compressor = BtrBlocksCompressorBuilder::from_session(&self.session);
+                if !enforce_editions {
+                    compressor = compressor.disable_editions();
+                }
+                WriteStrategyBuilder::from_session(&self.session)
+                    .with_btrblocks_builder(compressor)
+                    .build()
+            }
+        };
+        (ctx, strategy)
     }
 
     /// Create a push-based [`Writer`] that can be used to incrementally write arrays to the file.
@@ -768,6 +930,273 @@ impl<W: Write + Unpin + Send> VortexWrite for BlockingWriteAdapter<W> {
 
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> + Send {
         ready(Ok(()))
+    }
+}
+
+/// Where [`VortexWriteOptions::write_internal`] sends the file, one segment at a time.
+///
+/// The futures are `Send`, so the whole write stays `Send` for callers that spawn it.
+trait SegmentOutput: Send {
+    /// Write one segment, returning it if the output is done with it.
+    fn write(
+        &mut self,
+        segment: Segment,
+    ) -> impl Future<Output = io::Result<Option<Segment>>> + Send;
+
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+/// Writes each segment's pieces with [`VortexWrite::write_all`].
+struct WriteOutput<W>(W);
+
+impl<W: VortexWrite + Unpin> SegmentOutput for WriteOutput<W> {
+    fn write(
+        &mut self,
+        segment: Segment,
+    ) -> impl Future<Output = io::Result<Option<Segment>>> + Send {
+        write_segment_to(&mut self.0, segment).map(|result| result.map(Some))
+    }
+
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.flush()
+    }
+}
+
+/// Hands each segment to a [`SegmentWrite`] once it has credit.
+struct SegmentWriteOutput<W>(W);
+
+impl<W: SegmentWrite + Send + Unpin> SegmentOutput for SegmentWriteOutput<W> {
+    async fn write(&mut self, segment: Segment) -> io::Result<Option<Segment>> {
+        poll_fn(|cx| self.0.poll_credit(cx)).await?;
+        self.0.write_segment(segment)?;
+        Ok(self.0.take_returned())
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        poll_fn(|cx| self.0.poll_flush(cx)).await
+    }
+}
+
+/// One range of a file written by [`VortexWriteOptions::write_range`].
+///
+/// It owns the range's segment bodies, its layout tree with segment ids numbered from 0, and
+/// its deferred zone maps.
+pub struct RangeWrite {
+    layout: LayoutRef,
+    segments: Vec<(Segment, BufferedBytesReservation)>,
+    zones: Vec<DeferredZones>,
+    array_ids: Vec<Id>,
+}
+
+impl RangeWrite {
+    /// Rows in the range.
+    pub fn row_count(&self) -> u64 {
+        self.layout.row_count()
+    }
+
+    /// Segments the range wrote, in file order.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Bytes of the range's segment bodies, without padding.
+    pub fn body_bytes(&self) -> u64 {
+        self.segments.iter().map(|(segment, _)| segment.len()).sum()
+    }
+}
+
+/// A stitched write in progress, from [`VortexWriteOptions::begin_stitched`].
+pub struct StitchedWriter<W> {
+    options: VortexWriteOptions,
+    output: WriteOutput<W>,
+    ctx: LayoutWriterContext,
+    array_ids: Vec<Id>,
+    sink: Arc<StitchSegmentSink>,
+    layouts: Vec<RangeLayout>,
+    enforce_editions: bool,
+}
+
+impl<W: VortexWrite + Unpin> StitchedWriter<W> {
+    /// Bytes placed so far: the magic and every pushed range's padded segments.
+    pub fn position(&self) -> u64 {
+        self.sink.placement.lock().position
+    }
+
+    /// Place and write the next range's segments after the ones before it.
+    pub async fn push(&mut self, range: RangeWrite) -> VortexResult<()> {
+        if let Some(first) = self.layouts.first()
+            && range.layout.dtype() != first.layout.dtype()
+        {
+            vortex_bail!("stitched ranges disagree on dtype");
+        }
+        if range.array_ids != self.array_ids {
+            vortex_bail!("a range write interned array encodings the file context lacks");
+        }
+        let first_segment_id = self.sink.next_id()?;
+        for (mut segment, held) in range.segments {
+            self.sink.place(&mut segment)?;
+            self.output.write(segment).await?;
+            drop(held);
+        }
+        self.layouts.push(RangeLayout {
+            layout: range.layout,
+            zones: range.zones,
+            first_segment_id,
+        });
+        Ok(())
+    }
+
+    /// Write the zone tables and the footer of the joined tree.
+    pub async fn finish(self) -> VortexResult<WriteSummary> {
+        let Self {
+            options,
+            mut output,
+            ctx,
+            array_ids,
+            sink,
+            layouts,
+            enforce_editions,
+        } = self;
+        if layouts.is_empty() {
+            vortex_bail!("a stitched write needs at least one range");
+        }
+        let (_, eof) = SequenceId::root().split();
+        let layout = stitch_range_layouts(
+            layouts,
+            ctx.clone(),
+            Arc::<StitchSegmentSink>::clone(&sink),
+            eof,
+            &options.session,
+        )
+        .await?;
+        let zone_segments = std::mem::take(&mut *sink.held.lock());
+        for segment in zone_segments {
+            output.write(segment).await?;
+        }
+        if ctx.array_ctx().to_ids() != array_ids {
+            vortex_bail!("the stitched zone tables interned array encodings after the ranges");
+        }
+        let (segment_specs, mut position) = {
+            let placement = sink.placement.lock();
+            (placement.specs.clone(), placement.position)
+        };
+
+        let mut footer = Footer::new(
+            Arc::clone(&layout),
+            segment_specs.into(),
+            None,
+            ReadContext::new(array_ids),
+        );
+        let (footer_segment, metadata, approx_byte_size) = footer
+            .clone()
+            .into_serializer(&options.session)
+            .with_layout_context(new_layout_context(&options.session, enforce_editions))
+            .with_metadata_segments(options.metadata)
+            .with_offset(position)
+            .with_exclude_dtype(options.exclude_dtype)
+            .serialize_with_metadata()?;
+        footer = footer
+            .with_metadata_segments(metadata)
+            .with_approx_byte_size(approx_byte_size);
+
+        position += footer_segment.padded_len();
+        output.write(footer_segment).await?;
+        output.flush().await?;
+
+        Ok(WriteSummary {
+            footer,
+            size: position,
+        })
+    }
+}
+
+/// Keeps a range's segments in sequence order, numbered from 0, each counted as buffered on
+/// the write's tracker until it is placed.
+struct RangeSegmentSink {
+    segments: parking_lot::Mutex<Vec<(Segment, BufferedBytesReservation)>>,
+    tracker: BufferedBytesTracker,
+}
+
+#[async_trait::async_trait]
+impl SegmentSink for RangeSegmentSink {
+    async fn write(
+        &self,
+        mut sequence_id: SequenceId,
+        segment: Segment,
+    ) -> VortexResult<SegmentId> {
+        sequence_id.collapse().await;
+        let held = self.tracker.reserve(segment.len());
+        let mut segments = self.segments.lock();
+        let segment_id = SegmentId::try_from(segments.len())?;
+        segments.push((segment, held));
+        Ok(segment_id)
+    }
+}
+
+struct Placement {
+    specs: Vec<SegmentSpec>,
+    position: u64,
+}
+
+/// Places segments at their final offsets, as [`BufferedSegmentSink`] does for one write.
+///
+/// Data segments are placed by the stitch directly; zone tables arrive through
+/// [`SegmentSink::write`] and are held until every one is placed.
+struct StitchSegmentSink {
+    placement: parking_lot::Mutex<Placement>,
+    held: parking_lot::Mutex<Vec<Segment>>,
+}
+
+impl StitchSegmentSink {
+    fn new(position: u64) -> Self {
+        Self {
+            placement: parking_lot::Mutex::new(Placement {
+                specs: Vec::new(),
+                position,
+            }),
+            held: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn next_id(&self) -> VortexResult<u32> {
+        u32::try_from(self.placement.lock().specs.len())
+            .map_err(|_| vortex_err!("Too many segments, u32 overflow"))
+    }
+
+    fn place(&self, segment: &mut Segment) -> VortexResult<SegmentId> {
+        let mut placement = self.placement.lock();
+        let segment_id = SegmentId::try_from(placement.specs.len())
+            .map_err(|_| vortex_err!("Too many segments, u32 overflow"))?;
+        let alignment = segment.alignment();
+        let length = u32::try_from(segment.len())
+            .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
+        let byte_offset = placement.position;
+        let padding = byte_offset.next_multiple_of(alignment.as_usize() as u64) - byte_offset;
+        let offset = byte_offset + padding;
+        placement.specs.push(SegmentSpec {
+            offset,
+            length,
+            alignment,
+        });
+        placement.position = byte_offset + padding + u64::from(length);
+        segment.set_leading_zeros(
+            u32::try_from(padding)
+                .map_err(|_| vortex_err!("segment padding exceeds maximum u32"))?,
+        );
+        Ok(segment_id)
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentSink for StitchSegmentSink {
+    async fn write(
+        &self,
+        _sequence_id: SequenceId,
+        mut segment: Segment,
+    ) -> VortexResult<SegmentId> {
+        let segment_id = self.place(&mut segment)?;
+        self.held.lock().push(segment);
+        Ok(segment_id)
     }
 }
 

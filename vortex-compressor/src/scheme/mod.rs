@@ -10,6 +10,7 @@ pub use ctx::MAX_CASCADE;
 
 pub(crate) mod estimate;
 mod exclusion;
+mod site_path;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -23,6 +24,11 @@ pub use estimate::EstimateVerdict;
 pub use exclusion::AncestorExclusion;
 pub use exclusion::ChildSelection;
 pub use exclusion::DescendantExclusion;
+pub use site_path::MAX_SITE_DEPTH;
+pub use site_path::ROOT_SCHEME_NAME;
+pub use site_path::SiteKey;
+pub use site_path::SitePath;
+pub use site_path::site;
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -124,7 +130,17 @@ pub trait Scheme: AsDynScheme + Debug + Send + Sync {
     /// Whether this scheme can compress the given canonical array.
     fn matches(&self, canonical: &Canonical) -> bool;
 
-    /// The serialized IDs this scheme itself may write into its compressed output.
+    /// Eligibility for an existing Utf8 dictionary without canonical expansion.
+    ///
+    /// `Some(true)` also promises that estimates accept dictionary-backed data using
+    /// string statistics, dtype and length only. Full compression receives canonical
+    /// input, except StringDict which consumes the retained dictionary. `None` keeps
+    /// the legacy canonical path for schemes that inspect physical input contents.
+    fn matches_string_dictionary(&self) -> Option<bool> {
+        None
+    }
+
+    /// The array encodings this scheme itself may introduce into its compressed output.
     ///
     /// Every declared ID must be permitted for the scheme to be used. Cascaded children are
     /// compressed by other schemes, which declare their own IDs, so only arrays constructed

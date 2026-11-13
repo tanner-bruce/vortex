@@ -69,5 +69,12 @@ pub mod stats;
 
 mod compressor;
 pub use compressor::CascadingCompressor;
+#[cfg(feature = "site-observer")]
+pub use compressor::ObservedSite;
+pub use compressor::PinSpec;
+pub use compressor::PinTally;
+pub use compressor::SchemePins;
+pub use compressor::StringDictionaryCapacity;
+pub use compressor::StringDictionaryMemoryShape;
 
 mod trace;

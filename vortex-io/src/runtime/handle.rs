@@ -42,6 +42,14 @@ impl Handle {
         })
     }
 
+    /// Whether futures spawned only for a waiting caller run inside its poll instead; see
+    /// [`Executor::run_inline`]. False once the runtime is gone.
+    pub fn run_inline(&self) -> bool {
+        self.runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.run_inline())
+    }
+
     /// Returns a handle to the current runtime, if such a reasonable choice exists.
     ///
     /// For example, if called from within a Tokio context this will return a
