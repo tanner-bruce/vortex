@@ -4,6 +4,7 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use allocator_api2::alloc::AllocError;
 use allocator_api2::alloc::Allocator;
@@ -21,13 +22,15 @@ use super::dict_encode_with_constraints;
 use super::dict_encoder_in;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
-use crate::array_session;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBinArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::assert_arrays_eq;
 use crate::dtype::PType;
+use vortex_session::VortexSession;
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
 #[rstest]
 #[case(0)]
@@ -47,7 +50,7 @@ fn one_shot_matches_unconstrained(#[case] len: usize) -> VortexResult<()> {
         PrimitiveArray::from_option_iter((0..len).map(|i| (i % 3 != 0).then_some(i as i64)))
             .into_array(),
     ];
-    let mut ctx = array_session().create_execution_ctx();
+    let mut ctx = SESSION.create_execution_ctx();
     for input in inputs {
         let baseline = dict_encode_with_constraints(&input, &UNCONSTRAINED, &mut ctx)?;
         let candidate = dict_encode(&input, &mut ctx)?;
@@ -62,7 +65,7 @@ fn one_shot_matches_unconstrained(#[case] len: usize) -> VortexResult<()> {
 
 #[test]
 fn nullable_slices_and_repeated_values() -> VortexResult<()> {
-    let mut ctx = array_session().create_execution_ctx();
+    let mut ctx = SESSION.create_execution_ctx();
     for values in [
         vec![None; 7],
         vec![Some(""), None, Some("red"), Some("red"), None, Some("")],
@@ -80,7 +83,7 @@ fn nullable_slices_and_repeated_values() -> VortexResult<()> {
 
 #[test]
 fn constraints_and_stateful_encoder_are_unchanged() -> VortexResult<()> {
-    let mut ctx = array_session().create_execution_ctx();
+    let mut ctx = SESSION.create_execution_ctx();
     let first = VarBinViewArray::from_iter_str(["first"]).into_array();
     let second = VarBinViewArray::from_iter_str(["second", "third", "first"]).into_array();
     let mut encoder = dict_encoder_in(&first, &UNCONSTRAINED, ctx.allocator().clone());
@@ -94,7 +97,8 @@ fn constraints_and_stateful_encoder_are_unchanged() -> VortexResult<()> {
             ..UNCONSTRAINED
         };
         let prefix = dict_encode_with_constraints(&second, &constraints, &mut ctx)?;
-        assert_eq!(prefix.len(), max_len);
+        // 0.93.0 admits the first entry even over the budget so the caller makes progress.
+        assert_eq!(prefix.len(), max_len.max(1));
     }
     let constraints = DictConstraints {
         max_bytes: 0,
@@ -102,7 +106,7 @@ fn constraints_and_stateful_encoder_are_unchanged() -> VortexResult<()> {
     };
     assert_eq!(
         dict_encode_with_constraints(&second, &constraints, &mut ctx)?.len(),
-        0
+        1
     );
     Ok(())
 }
@@ -128,7 +132,7 @@ fn one_shot_allocates_u32_working_codes() -> VortexResult<()> {
     let len = 65_537;
     let input = VarBinViewArray::from_iter_str(std::iter::repeat_n("same", len)).into_array();
     let sizes = Arc::new(Mutex::new(Vec::new()));
-    let mut ctx = array_session()
+    let mut ctx = SESSION
         .create_execution_ctx()
         .with_allocator(BufferAllocatorRef::new(RecordingAllocator(Arc::clone(
             &sizes,

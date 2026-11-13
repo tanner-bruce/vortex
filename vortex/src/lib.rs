@@ -156,15 +156,12 @@ pub mod buffer {
 pub mod compressor {
     pub use vortex_btrblocks::BtrBlocksCompressor;
     pub use vortex_btrblocks::BtrBlocksCompressorBuilder;
-<<<<<<< HEAD
     pub use vortex_btrblocks::CompressionSession;
     pub use vortex_btrblocks::CompressionSessionExt;
-=======
     #[cfg(feature = "site-observer")]
     pub use vortex_btrblocks::ObservedSite;
     pub use vortex_btrblocks::PinSpec;
     pub use vortex_btrblocks::PinTally;
->>>>>>> c666989f8 (Scheme pins: replay a fixed decision per compression site)
     pub use vortex_btrblocks::Scheme;
     pub use vortex_btrblocks::SchemeId;
     pub use vortex_btrblocks::SchemePins;
