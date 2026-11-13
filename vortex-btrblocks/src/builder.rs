@@ -143,10 +143,20 @@ pub struct BtrBlocksCompressorBuilder {
 }
 
 impl Default for BtrBlocksCompressorBuilder {
-    /// Every built-in scheme, unrestricted, as the fork's `ALL_SCHEMES` default was.
+    /// Every built-in scheme except the feature-gated compact schemes, unrestricted, as the
+    /// fork's `ALL_SCHEMES` default was. `with_compact` adds those schemes explicitly.
     fn default() -> Self {
+        let schemes = crate::CompressionSession::default()
+            .schemes()
+            .iter()
+            .copied()
+            .filter(|scheme| {
+                let name = scheme.id().to_string();
+                !name.contains("zstd") && !name.contains("pco")
+            })
+            .collect();
         Self {
-            schemes: crate::CompressionSession::default().schemes().to_vec(),
+            schemes,
             allowed: AllowedIds::all(),
             mode: CompressionMode::All,
             string_dictionary_reuse: false,
@@ -209,6 +219,25 @@ impl BtrBlocksCompressorBuilder {
     /// features.
     pub fn with_compact(mut self) -> Self {
         self.mode = CompressionMode::Compact;
+        #[cfg(feature = "zstd")]
+        {
+            let mut add = |scheme: &'static dyn Scheme| {
+                if !self
+                    .schemes
+                    .iter()
+                    .any(|present| present.id() == scheme.id())
+                {
+                    self.schemes.push(scheme);
+                }
+            };
+            add(&string::ZstdScheme);
+            add(&binary::ZstdScheme);
+            #[cfg(feature = "pco")]
+            {
+                add(&integer::PcoScheme);
+                add(&float::PcoScheme);
+            }
+        }
         self
     }
 
