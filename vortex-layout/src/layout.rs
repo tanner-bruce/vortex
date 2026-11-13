@@ -266,6 +266,11 @@ pub trait DynLayout: 'static + Send + Sync + Debug {
         let ids = self.dyn_segment_ids();
         cx.enter_materialised(self, &ids)
     }
+    /// Rebuild this node with empty child caches, where backed by a verified flatbuffer.
+    fn dyn_rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        None
+    }
+
     /// Number of populated child-cache entries, where supported.
     fn dyn_cached_children(&self) -> usize {
         0
@@ -338,6 +343,10 @@ impl<V: VTable> DynLayout for Layout<V> {
                 .map(Some),
             None => Ok(None),
         }
+    }
+
+    fn dyn_rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        self.inner.children.rebuild_owner(self.dtype())
     }
 
     fn dyn_cached_children(&self) -> usize {
@@ -491,6 +500,12 @@ impl dyn DynLayout + '_ {
     ) -> VortexResult<()> {
         VisitCx::new(visitor, stats).materialised(self)
     }
+    /// Rebuild this node from its verified flatbuffer with empty child caches.
+    /// Returns `None` for layouts whose children are not flatbuffer-backed.
+    pub fn rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        self.dyn_rebuild_uncached()
+    }
+
     /// Number of populated immediate child cache entries.
     pub fn cached_children(&self) -> usize {
         self.dyn_cached_children()

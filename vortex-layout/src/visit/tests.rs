@@ -5,6 +5,7 @@ use std::sync::Arc;
 use flatbuffers::FlatBufferBuilder;
 use flatbuffers::WIPOffset;
 use vortex_array::dtype::Nullability;
+use vortex_array::dtype::StructFields;
 use vortex_flatbuffers::FlatBuffer;
 use vortex_session::VortexSession;
 
@@ -16,6 +17,8 @@ use crate::LayoutReaderRef;
 use crate::LayoutRef;
 use crate::VTable;
 use crate::layout_from_flatbuffer_with_options;
+use crate::layouts::chunked::ChunkedLayout;
+use crate::layouts::struct_::Struct;
 use crate::segments::SegmentSource;
 use crate::session::LayoutSessionExt;
 
@@ -263,5 +266,64 @@ fn plugin_under_builtin_id_uses_build_fallback() -> VortexResult<()> {
     assert_eq!(stats.flatbuffer_nodes, 0);
     assert_eq!(stats.materialised_nodes, 2);
     assert_eq!(node.cached_children(), 0);
+    Ok(())
+}
+
+#[test]
+fn rebuild_uncached_matches_parsed_root_and_leaves_original_cache_intact() -> VortexResult<()> {
+    let session = crate::test::new_session();
+    let dtype = DType::Struct(
+        StructFields::new(
+            ["value"].into(),
+            vec![DType::Bool(Nullability::NonNullable)],
+        ),
+        Nullability::NonNullable,
+    );
+    let raw = Raw {
+        encoding: 2,
+        rows: 6,
+        metadata: vec![],
+        ids: vec![],
+        children: vec![Raw::chunked(vec![Raw::flat(), Raw::flat()], 6)],
+    };
+    let mut builder = FlatBufferBuilder::new();
+    let root = raw.write(&mut builder);
+    builder.finish(root, None);
+    let original = layout_from_flatbuffer_with_options(
+        FlatBuffer::copy_from(builder.finished_data()),
+        &dtype,
+        &ReadContext::new([Flat.id(), Chunked.id(), Struct.id()]),
+        &ReadContext::new([]),
+        &session,
+        false,
+    )?;
+    let mut expected = Facts::default();
+    reference(&original, VisitedPosition::Root, &mut expected)?;
+    assert_eq!(original.cached_children(), 1);
+    let rebuilt = original.rebuild_uncached().expect("viewed root")?;
+    assert_eq!(rebuilt.cached_children(), 0);
+    assert_eq!(original.cached_children(), 1);
+    assert!(!Arc::ptr_eq(&original, &rebuilt));
+    assert_eq!(rebuilt.encoding_id(), original.encoding_id());
+    assert_eq!(rebuilt.dtype(), original.dtype());
+    assert_eq!(rebuilt.row_count(), original.row_count());
+    assert_eq!(rebuilt.segment_ids(), original.segment_ids());
+    assert_eq!(rebuilt.nchildren(), original.nchildren());
+    let mut actual = Facts::default();
+    reference(&rebuilt, VisitedPosition::Root, &mut actual)?;
+    assert_eq!(actual.0, expected.0);
+    Ok(())
+}
+
+#[test]
+fn rebuild_uncached_returns_none_for_owned_children() -> VortexResult<()> {
+    let session = crate::test::new_session();
+    let layout = ChunkedLayout::new(
+        3,
+        DType::Bool(Nullability::NonNullable),
+        crate::layout_children(vec![Raw::flat().open(&session, false)?]),
+    )
+    .into_layout();
+    assert!(layout.rebuild_uncached().is_none());
     Ok(())
 }

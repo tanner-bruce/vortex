@@ -55,6 +55,12 @@ pub trait LayoutChildren: 'static + Send + Sync {
         Ok(())
     }
 
+    /// Rebuild the owner node from the same verified flatbuffer with empty child caches.
+    /// Returns `None` when these children are not flatbuffer-backed.
+    fn rebuild_owner(&self, _dtype: &DType) -> Option<VortexResult<LayoutRef>> {
+        None
+    }
+
     /// Number of retained child cache entries, when this adapter has a cache.
     fn cached_children(&self) -> usize {
         0
@@ -100,6 +106,9 @@ impl LayoutChildren for Arc<dyn LayoutChildren> {
     }
     fn visit_children(&self, dtype: &DType, cx: &mut VisitCx<'_>) -> VortexResult<()> {
         self.as_ref().visit_children(dtype, cx)
+    }
+    fn rebuild_owner(&self, dtype: &DType) -> Option<VortexResult<LayoutRef>> {
+        self.as_ref().rebuild_owner(dtype)
     }
     fn cached_children(&self) -> usize {
         self.as_ref().cached_children()
@@ -336,6 +345,10 @@ impl ViewedLayoutChildren {
 }
 
 impl LayoutChildren for ViewedLayoutChildren {
+    fn rebuild_owner(&self, dtype: &DType) -> Option<VortexResult<LayoutRef>> {
+        Some(self.build_layout(self.flatbuffer(), dtype))
+    }
+
     fn to_arc(&self) -> Arc<dyn LayoutChildren> {
         Arc::new(self.clone())
     }

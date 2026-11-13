@@ -159,6 +159,20 @@ impl Footer {
         })
     }
 
+    /// Rebuild the root from the same verified flatbuffer with empty child caches.
+    ///
+    /// The segment map, statistics, metadata, read contexts and approximate byte size
+    /// are shared or preserved. Returns `None` for a root that is not flatbuffer-backed.
+    pub fn with_fresh_root(&self) -> VortexResult<Option<Self>> {
+        let Some(root_layout) = self.root_layout.rebuild_uncached().transpose()? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            root_layout,
+            ..self.clone()
+        }))
+    }
+
     /// Returns the root [`LayoutRef`] of the file.
     pub fn layout(&self) -> &LayoutRef {
         &self.root_layout
