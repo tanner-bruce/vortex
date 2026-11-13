@@ -197,7 +197,6 @@ impl ViewedLayoutChildren {
         let fb_children = unsafe { fbl::Layout::follow(flatbuffer.as_ref(), flatbuffer_loc) }
             .children()
             .unwrap_or_default();
-        crate::visit::record_children_construction(fb_children.len());
         let cache = vec![OnceCell::new(); fb_children.len()]
             .into_boxed_slice()
             .into();

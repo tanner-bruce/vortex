@@ -2,10 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Uncached visits over the verified layout view. Unmodelled encodings use the normal build.
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
-
 use vortex_array::DeserializeMetadata;
 use vortex_array::EmptyMetadata;
 use vortex_array::ProstMetadata;
@@ -276,28 +272,6 @@ impl<'a> VisitCx<'a> {
         }
         self.leave();
         Ok(())
-    }
-}
-
-static COUNT_CHILDREN: AtomicBool = AtomicBool::new(false);
-static CHILDREN_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
-static CHILDREN_SLOTS: AtomicU64 = AtomicU64::new(0);
-
-/// Enable the optional construction attribution at benchmark boundaries. Disabled by default.
-pub fn enable_layout_children_diagnostics(enabled: bool) {
-    COUNT_CHILDREN.store(enabled, Relaxed);
-}
-/// Process-wide diagnostic totals, meaningful only around an isolated harness window.
-pub fn layout_children_diagnostics() -> (u64, u64) {
-    (
-        CHILDREN_CONSTRUCTIONS.load(Relaxed),
-        CHILDREN_SLOTS.load(Relaxed),
-    )
-}
-pub(crate) fn record_children_construction(children: usize) {
-    if COUNT_CHILDREN.load(Relaxed) {
-        CHILDREN_CONSTRUCTIONS.fetch_add(1, Relaxed);
-        CHILDREN_SLOTS.fetch_add(children as u64, Relaxed);
     }
 }
 
