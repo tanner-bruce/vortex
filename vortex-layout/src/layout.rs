@@ -19,9 +19,16 @@ use vortex_session::registry::Id;
 
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
+use crate::LayoutVisitor;
+use crate::VisitCx;
+use crate::VisitStats;
+use crate::VisitedLayout;
+use crate::VisitedPosition;
+use crate::VisitedSegments;
 use crate::children::LayoutChildren;
 use crate::display::DisplayLayoutTree;
 use crate::display::display_tree_with_segment_sizes;
+use crate::layouts::chunked::Chunked;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 use crate::vtable::LayoutRef;
@@ -250,6 +257,26 @@ pub trait DynLayout: 'static + Send + Sync + Debug {
     /// Materializes the child in logical `slot`, or `None` if the slot is absent.
     fn dyn_slot(&self, slot: usize) -> VortexResult<Option<LayoutRef>>;
 
+    /// Uncached counterpart of `dyn_slot`; default preserves foreign implementations.
+    fn dyn_slot_uncached(&self, slot: usize) -> VortexResult<Option<LayoutRef>> {
+        self.dyn_slot(slot)
+    }
+    /// Visit this node at the context's current position.
+    fn dyn_visit(&self, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        let ids = self.dyn_segment_ids();
+        cx.enter_materialised(self, &ids)
+    }
+    /// Rebuild this node with an independent child cache, where backed by a verified flatbuffer.
+    /// Struct leaves the new cache empty; Zoned populates it eagerly during deserialization.
+    fn dyn_rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        None
+    }
+
+    /// Number of populated child-cache entries, where supported.
+    fn dyn_cached_children(&self) -> usize {
+        0
+    }
+
     /// Returns the relationship of the child in logical `slot`, or `None` if the slot is absent.
     fn dyn_slot_type(&self, slot: usize) -> Option<LayoutChildType>;
 
@@ -306,6 +333,60 @@ impl<V: VTable> DynLayout for Layout<V> {
 
     fn dyn_slot(&self, slot: usize) -> VortexResult<Option<LayoutRef>> {
         Layout::slot(self, slot)
+    }
+
+    fn dyn_slot_uncached(&self, slot: usize) -> VortexResult<Option<LayoutRef>> {
+        match V::slot_to_child(self, slot) {
+            Some(idx) => self
+                .inner
+                .children
+                .child_uncached(idx, &V::child_dtype(self, slot)?)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn dyn_rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        self.inner.children.rebuild_owner(self.dtype())
+    }
+
+    fn dyn_cached_children(&self) -> usize {
+        self.inner.children.cached_children()
+    }
+
+    fn dyn_visit(&self, cx: &mut VisitCx<'_>) -> VortexResult<()> {
+        cx.stats.materialised_nodes += 1;
+        let descend = cx.enter(&VisitedLayout {
+            encoding: self.dyn_encoding_id(),
+            row_count: self.row_count(),
+            segment_ids: VisitedSegments::Materialised(self.segment_ids()),
+            position: cx.position,
+            materialised: true,
+        })?;
+        if descend {
+            if self.as_any().is::<Layout<Chunked>>() {
+                self.inner.children.visit_children(self.dtype(), cx)?;
+            } else {
+                for slot in 0..self.nslots() {
+                    if let Some(idx) = V::slot_to_child(self, slot) {
+                        let dtype = V::child_dtype(self, slot)?;
+                        cx.position =
+                            if matches!(V::child_type(self, slot), LayoutChildType::Auxiliary(_)) {
+                                VisitedPosition::Auxiliary
+                            } else {
+                                VisitedPosition::Positioned(
+                                    cx.row_offsets()
+                                        .then(|| V::child_type(self, slot).row_offset())
+                                        .flatten(),
+                                )
+                            };
+                        self.inner.children.visit_child(idx, &dtype, cx)?;
+                    }
+                }
+            }
+        }
+        cx.leave();
+        Ok(())
     }
 
     fn dyn_slot_type(&self, slot: usize) -> Option<LayoutChildType> {
@@ -402,6 +483,34 @@ impl dyn DynLayout + '_ {
     /// Materializes the child in logical `slot`, or `None` if the slot is absent.
     pub fn slot(&self, slot: usize) -> VortexResult<Option<LayoutRef>> {
         self.dyn_slot(slot)
+    }
+
+    /// Materialize a slot without retaining a newly built child in its cache.
+    pub fn slot_uncached(&self, slot: usize) -> VortexResult<Option<LayoutRef>> {
+        self.dyn_slot_uncached(slot)
+    }
+    /// Visit nodes in pre-order and slots ascending; do not populate viewed-child caches.
+    pub fn visit(&self, visitor: &mut dyn LayoutVisitor) -> VortexResult<()> {
+        self.visit_with_stats(visitor, &mut VisitStats::default())
+    }
+    /// Visit with bounded per-call diagnostic counters, also available on failure.
+    pub fn visit_with_stats(
+        &self,
+        visitor: &mut dyn LayoutVisitor,
+        stats: &mut VisitStats,
+    ) -> VortexResult<()> {
+        VisitCx::new(visitor, stats).materialised(self)
+    }
+    /// Rebuild this node from its verified flatbuffer with an independent child cache.
+    /// Struct leaves the new cache empty; layouts such as Zoned populate it eagerly.
+    /// Returns `None` for layouts whose children are not flatbuffer-backed.
+    pub fn rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
+        self.dyn_rebuild_uncached()
+    }
+
+    /// Number of populated immediate child cache entries.
+    pub fn cached_children(&self) -> usize {
+        self.dyn_cached_children()
     }
 
     /// Returns the relationship of the child in logical `slot`, or `None` if the slot is absent.
