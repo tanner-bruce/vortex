@@ -255,7 +255,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
             // Splits therefore filter and project ahead of the consumer, and the rows they
             // return are taken from the limit as they are emitted, discarding the excess. Split
             // tasks are built lazily so that no new splits start once the budget is spent. The
-            // map function needs the trimmed arrays, so it runs in a second stage of CPU tasks.
+            // map function needs the trimmed arrays, so it runs in a second stage, in the caller
+            // for inline scans and in CPU tasks otherwise.
             Some(limit) if ctx.filter.is_some() => {
                 let gate = limit.clone();
                 let selection = self.selection.clone();
@@ -270,15 +271,18 @@ impl<A: 'static + Send> RepeatedScan<A> {
                             let selection = selection.clone();
                             let row_range = row_range.clone();
                             async move {
-                                let task = handle
-                                    .spawn_cpu(move || {
-                                        let row_mask = selection.row_mask(&row_range);
-                                        if row_mask.mask().all_false() {
-                                            return Ok(None);
-                                        }
-                                        split_exec(&ctx, row_mask).map(Some)
-                                    })
-                                    .await?;
+                                let build = move || {
+                                    let row_mask = selection.row_mask(&row_range);
+                                    if row_mask.mask().all_false() {
+                                        return Ok(None);
+                                    }
+                                    split_exec(&ctx, row_mask).map(Some)
+                                };
+                                let task = if handle.run_inline() {
+                                    build()?
+                                } else {
+                                    handle.spawn_cpu(build).await?
+                                };
                                 match task {
                                     Some(task) => task.await,
                                     None => Ok(None),
@@ -297,7 +301,11 @@ impl<A: 'static + Send> RepeatedScan<A> {
                     .boxed();
                 let mapped = limit_rows(arrays, limit).map(move |array| {
                     let map_fn = Arc::clone(&map_fn);
-                    handle.spawn_cpu(move || map_fn(array?))
+                    if inline {
+                        future::Either::Left(future::ready(array.and_then(|array| map_fn(array))))
+                    } else {
+                        future::Either::Right(handle.spawn_cpu(move || map_fn(array?)))
+                    }
                 });
                 buffer(mapped, ordered, concurrency)
             }
