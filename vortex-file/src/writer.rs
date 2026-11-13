@@ -335,14 +335,22 @@ impl VortexWriteOptions {
         let write_nested_statistics =
             self.write_nested_statistics && ctx.allows_aggregate(&Min.id());
 
-        let (file_stats, stream) = accumulate_stats(
-            stream,
-            file_statistics,
-            &self.session,
-            write_nested_statistics,
-            self.write_legacy_statistics,
-            &ctx,
-        )?;
+        // A write that records no file statistics must not pass its input through the
+        // statistics fan-out: that stage prefetches up to the machine's parallelism, which
+        // retains input chunks a stalled output would otherwise hold back.
+        let (file_stats, stream) = if omit_statistics {
+            (None, stream)
+        } else {
+            let (stats, stream) = accumulate_stats(
+                stream,
+                file_statistics,
+                &self.session,
+                write_nested_statistics,
+                self.write_legacy_statistics,
+                &ctx,
+            )?;
+            (Some(stats), stream)
+        };
 
         // First, write the magic bytes.
         let mut magic = Segment::new();
@@ -392,19 +400,17 @@ impl VortexWriteOptions {
         let ((layout, segment_specs), ()) = try_join(layout_fut, drain_fut).await?;
 
         // Assemble the Footer object now that we have all the segments.
-        let statistics = if omit_statistics {
-            None
-        } else if write_nested_statistics {
-            Some(FileStatistics::new_with_dtype(
+        let statistics = match file_stats {
+            None => None,
+            Some(file_stats) if write_nested_statistics => Some(FileStatistics::new_with_dtype(
                 file_stats.aggregate_stats()?.into(),
                 file_stats.legacy_aggregate_stats()?.into(),
                 &dtype,
-            ))
-        } else {
-            Some(FileStatistics::new_legacy_only(
+            )),
+            Some(file_stats) => Some(FileStatistics::new_legacy_only(
                 file_stats.legacy_aggregate_stats()?.into(),
                 &dtype,
-            ))
+            )),
         };
         let mut footer = Footer::new(
             Arc::clone(&layout),
