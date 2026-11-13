@@ -97,8 +97,7 @@ fn constraints_and_stateful_encoder_are_unchanged() -> VortexResult<()> {
             ..UNCONSTRAINED
         };
         let prefix = dict_encode_with_constraints(&second, &constraints, &mut ctx)?;
-        // 0.93.0 admits the first entry even over the budget so the caller makes progress.
-        assert_eq!(prefix.len(), max_len.max(1));
+        assert_eq!(prefix.len(), max_len);
     }
     let constraints = DictConstraints {
         max_bytes: 0,
@@ -106,8 +105,59 @@ fn constraints_and_stateful_encoder_are_unchanged() -> VortexResult<()> {
     };
     assert_eq!(
         dict_encode_with_constraints(&second, &constraints, &mut ctx)?.len(),
-        1
+        0
     );
+    Ok(())
+}
+
+#[test]
+fn constrained_first_entry_honors_byte_and_length_limits() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let value = "first string larger than the positive byte limit";
+    for input in [
+        VarBinViewArray::from_iter_str([value]).into_array(),
+        VarBinArray::from(vec![value]).into_array(),
+        vec![None::<&str>]
+            .into_iter()
+            .collect::<VarBinViewArray>()
+            .into_array(),
+        PrimitiveArray::from_iter([1_u64]).into_array(),
+        PrimitiveArray::from_option_iter([None::<u64>]).into_array(),
+    ] {
+        for constraints in [
+            DictConstraints {
+                max_bytes: 0,
+                ..UNCONSTRAINED
+            },
+            DictConstraints {
+                max_len: 0,
+                ..UNCONSTRAINED
+            },
+            DictConstraints {
+                max_bytes: 1,
+                ..UNCONSTRAINED
+            },
+        ] {
+            let encoded = dict_encode_with_constraints(&input, &constraints, &mut ctx)?;
+            assert_eq!(encoded.len(), 0);
+            assert_eq!(encoded.values().len(), 0);
+            // The upstream stateful layout path retains its progress guarantee.
+            let mut encoder = dict_encoder_in(&input, &constraints, ctx.allocator().clone());
+            assert_eq!(encoder.encode(&input, &mut ctx)?.len(), 1);
+        }
+    }
+    let input = VarBinViewArray::from_iter_str([value]).into_array();
+    let entry_bytes = 16 + value.len();
+    for (max_bytes, expected) in [(entry_bytes - 1, 0), (entry_bytes, 1)] {
+        let constraints = DictConstraints {
+            max_bytes,
+            ..UNCONSTRAINED
+        };
+        assert_eq!(
+            dict_encode_with_constraints(&input, &constraints, &mut ctx)?.len(),
+            expected
+        );
+    }
     Ok(())
 }
 

@@ -61,14 +61,39 @@ pub fn dict_encoder_in(
     constraints: &DictConstraints,
     allocator: BufferAllocatorRef,
 ) -> Box<dyn DictEncoder> {
+    // Stateful layout writers must make progress even when their first entry exceeds a budget.
+    dict_encoder_in_with_first_entry(array, constraints, allocator, true)
+}
+
+fn dict_encoder_in_with_first_entry(
+    array: &ArrayRef,
+    constraints: &DictConstraints,
+    allocator: BufferAllocatorRef,
+    allow_oversized_first_entry: bool,
+) -> Box<dyn DictEncoder> {
     let dict_builder: Box<dyn DictEncoder> = if let Some(pa) = array.as_opt::<Primitive>() {
         match_each_native_ptype!(pa.ptype(), |P| {
-            primitive_dict_builder::<P>(pa.dtype().nullability(), constraints, allocator)
+            primitive_dict_builder::<P>(
+                pa.dtype().nullability(),
+                constraints,
+                allocator,
+                allow_oversized_first_entry,
+            )
         })
     } else if let Some(vbv) = array.as_opt::<VarBinView>() {
-        bytes_dict_builder(vbv.dtype().clone(), constraints, allocator)
+        bytes_dict_builder(
+            vbv.dtype().clone(),
+            constraints,
+            allocator,
+            allow_oversized_first_entry,
+        )
     } else if let Some(vb) = array.as_opt::<VarBin>() {
-        bytes_dict_builder(vb.dtype().clone(), constraints, allocator)
+        bytes_dict_builder(
+            vb.dtype().clone(),
+            constraints,
+            allocator,
+            allow_oversized_first_entry,
+        )
     } else {
         vortex_panic!("Can only encode primitive or varbin/view arrays")
     };
@@ -83,7 +108,10 @@ pub fn dict_encode_with_constraints(
     constraints: &DictConstraints,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<DictArray> {
-    let mut encoder = dict_encoder_in(array, constraints, ctx.allocator().clone());
+    // A constrained one-shot encode returns a prefix, including an empty prefix when no
+    // dictionary entry fits. It must honor the limits even for the first value or null.
+    let mut encoder =
+        dict_encoder_in_with_first_entry(array, constraints, ctx.allocator().clone(), false);
     let codes = encoder.encode(array, ctx)?.narrow(ctx)?;
     // SAFETY: The encoding process will produce a value set of codes and values
     // All values in the dictionary are guaranteed to be referenced by at least one code
