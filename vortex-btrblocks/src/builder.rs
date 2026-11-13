@@ -245,6 +245,12 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Keeps only schemes whose produced encodings are all in `allowed`.
+    pub fn retain_allowed_encodings(mut self, allowed: &HashSet<ArrayId>) -> Self {
+        self.allowed.registered = Some(allowed.clone());
+        self
+    }
+
     /// Enables packed Utf8 samples and reuse of existing UInt32 string dictionaries.
     pub fn with_string_dictionary_reuse(mut self, enabled: bool) -> Self {
         self.string_dictionary_reuse = enabled;
