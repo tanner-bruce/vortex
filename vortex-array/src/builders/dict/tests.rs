@@ -14,6 +14,7 @@ use rstest::rstest;
 use vortex_buffer::Alignment;
 use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 
 use super::DictConstraints;
 use super::UNCONSTRAINED;
@@ -28,7 +29,6 @@ use crate::arrays::VarBinViewArray;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::assert_arrays_eq;
 use crate::dtype::PType;
-use vortex_session::VortexSession;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 

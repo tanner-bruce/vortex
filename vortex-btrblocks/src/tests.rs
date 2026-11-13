@@ -54,6 +54,7 @@ use vortex_session::VortexSession;
 use crate::BtrBlocksCompressor;
 use crate::BtrBlocksCompressorBuilder;
 use crate::SESSION;
+use crate::schemes::string::StringDictScheme;
 
 #[track_caller]
 fn assert_roundtrip(compressor: &BtrBlocksCompressor, input: &ArrayRef) -> VortexResult<ArrayRef> {
@@ -287,7 +288,7 @@ fn dictionary_reuse_recurses_into_struct_lists() -> VortexResult<()> {
     )?
     .into_array();
     let compressor = BtrBlocksCompressorBuilder::empty()
-        .with_new_scheme(&crate::schemes::string::StringDictScheme)
+        .with_new_scheme(&StringDictScheme)
         .with_string_dictionary_reuse(true)
         .build();
     let output = compressor.compress(&input, &mut ctx)?;
