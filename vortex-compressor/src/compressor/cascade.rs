@@ -210,17 +210,12 @@ impl CascadingCompressor {
                 let mut compress_ctx = compress_ctx;
                 compress_ctx.logical_strings = true;
                 return self
-                    .compress_planned(
-                        &eligible,
-                        compress_ctx,
-                        exec_ctx,
-                        |opts, exec_ctx| {
-                            let prepared = strings::analyze_dictionary(&dict, opts, exec_ctx)?;
-                            let data =
-                                ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
-                            Ok((data, prepared.packed_nbytes))
-                        },
-                    )
+                    .compress_planned(&eligible, compress_ctx, exec_ctx, |opts, exec_ctx| {
+                        let prepared = strings::analyze_dictionary(&dict, opts, exec_ctx)?;
+                        let data =
+                            ArrayAndStats::new_dictionary(prepared.array, opts, prepared.stats);
+                        Ok((data, prepared.packed_nbytes))
+                    })
                     .map(Selection::into_array);
             }
         }

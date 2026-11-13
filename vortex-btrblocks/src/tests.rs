@@ -230,23 +230,18 @@ fn dictionary_reuse_matches_flat_selection_across_sample_strides() -> VortexResu
                 })
                 .collect();
             let flat = VarBinViewArray::from_iter(
-                (0..8192).map(|i| {
-                    (i % stride == 0).then(|| values[(i / stride) % 16].as_str())
-                }),
+                (0..8192).map(|i| (i % stride == 0).then(|| values[(i / stride) % 16].as_str())),
                 DType::Utf8(Nullability::Nullable),
             )
             .into_array();
             let codes = PrimitiveArray::from_option_iter((0..8192).map(|i| {
-                (i % stride == 0).then_some(
-                    u32::try_from((i / stride) % 16).expect("16 dictionary values"),
-                )
+                (i % stride == 0)
+                    .then_some(u32::try_from((i / stride) % 16).expect("16 dictionary values"))
             }))
             .into_array();
-            let dict = DictArray::try_new(
-                codes,
-                VarBinViewArray::from_iter_str(values).into_array(),
-            )?
-            .into_array();
+            let dict =
+                DictArray::try_new(codes, VarBinViewArray::from_iter_str(values).into_array())?
+                    .into_array();
             let a = compressor.compress(&flat, &mut ctx)?;
             let b = compressor.compress(&dict, &mut ctx)?;
             assert_arrays_eq!(&flat, &b, &mut ctx);

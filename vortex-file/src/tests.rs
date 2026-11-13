@@ -2161,7 +2161,10 @@ async fn test_buffered_bytes_are_writer_scoped() -> VortexResult<()> {
     let settle = async {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let buffered = [first_tracker.buffered_bytes(), second_tracker.buffered_bytes()];
+            let buffered = [
+                first_tracker.buffered_bytes(),
+                second_tracker.buffered_bytes(),
+            ];
             for buffered in buffered {
                 assert!(buffered <= 2 * BUFFER_SIZE, "{buffered} bytes buffered");
             }

@@ -448,7 +448,11 @@ impl VortexWriteOptions {
         self,
         stream: S,
     ) -> VortexResult<RangeWrite> {
-        if self.file_statistics.as_ref().is_some_and(|stats| !stats.is_empty()) {
+        if self
+            .file_statistics
+            .as_ref()
+            .is_some_and(|stats| !stats.is_empty())
+        {
             vortex_bail!("a range write cannot record file statistics");
         }
         let enforce_editions = !self.disable_editions;
@@ -516,7 +520,11 @@ impl VortexWriteOptions {
         write: W,
     ) -> VortexResult<StitchedWriter<W>> {
         validate_metadata_segments(&self.metadata)?;
-        if self.file_statistics.as_ref().is_some_and(|stats| !stats.is_empty()) {
+        if self
+            .file_statistics
+            .as_ref()
+            .is_some_and(|stats| !stats.is_empty())
+        {
             vortex_bail!("a stitched write cannot record file statistics");
         }
         let enforce_editions = !self.disable_editions;
