@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use futures::SinkExt;
 use futures::channel::mpsc::Sender;
+use futures::lock::Mutex as AsyncMutex;
 use parking_lot::Mutex;
 use vortex_buffer::segment::Segment;
 use vortex_error::VortexResult;
@@ -23,7 +24,7 @@ use crate::footer::SegmentSpec;
 const MAX_RECYCLED_SEGMENTS: usize = 8;
 
 pub struct BufferedSegmentSink {
-    segments: Sender<Segment>,
+    segments: AsyncMutex<Sender<Segment>>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
     recycled: SegmentRecycler,
@@ -55,7 +56,7 @@ impl SegmentRecycler {
 impl BufferedSegmentSink {
     pub fn new(send: Sender<Segment>, byte_offset: u64) -> Self {
         Self {
-            segments: send,
+            segments: AsyncMutex::new(send),
             byte_offset: AtomicU64::new(byte_offset),
             segment_specs: Default::default(),
             recycled: Default::default(),
@@ -122,8 +123,10 @@ impl SegmentSink for BufferedSegmentSink {
             segment_id
         };
 
-        // Send the segment to the output.
-        drop(self.segments.clone().send(segment).await);
+        // Collapse serializes writers, so this guard is uncontended. Borrow the same sender
+        // across the bounded send instead of allocating sender state for each segment. The
+        // guard also retains the sender if this write is cancelled while awaiting the output.
+        drop(self.segments.lock().await.send(segment).await);
 
         Ok(segment_id)
     }
