@@ -343,6 +343,61 @@ mod tests {
     static SESSION: LazyLock<VortexSession> =
         LazyLock::new(|| VortexSession::empty().with::<CompressionSession>());
 
+    // Ordered ALL_SCHEMES names at the 0.86.1 fork head 2b1720e9c. Order determines ties.
+    const LEGACY_DEFAULT_SCHEMES: &[&str] = &[
+        "vortex.int.for",
+        "vortex.int.zigzag",
+        "vortex.int.bitpacking",
+        "vortex.int.sparse",
+        "vortex.int.dict",
+        "vortex.int.runend",
+        "vortex.int.sequence",
+        "vortex.int.rle",
+        "vortex.int.delta",
+        "vortex.float.alp",
+        "vortex.float.alprd",
+        "vortex.float.dict",
+        "vortex.float.sparse",
+        "vortex.float.rle",
+        "vortex.string.dict",
+        "vortex.string.fsst",
+        "vortex.string.onpair",
+        "vortex.string.sparse",
+        "vortex.binary.dict",
+        "vortex.binary.varbin",
+        "vortex.decimal.byte_parts",
+        "vortex.ext.temporal",
+    ];
+
+    fn scheme_names(builder: &BtrBlocksCompressorBuilder) -> Vec<&'static str> {
+        builder
+            .allowed_schemes()
+            .iter()
+            .map(|scheme| scheme.scheme_name())
+            .collect()
+    }
+
+    #[test]
+    fn default_matches_0_86_1_scheme_order() {
+        assert_eq!(
+            scheme_names(&BtrBlocksCompressorBuilder::default()),
+            LEGACY_DEFAULT_SCHEMES,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn compact_matches_0_86_1_scheme_order() {
+        let mut expected = LEGACY_DEFAULT_SCHEMES.to_vec();
+        expected.extend(["vortex.string.zstd", "vortex.binary.zstd"]);
+        #[cfg(feature = "pco")]
+        expected.extend(["vortex.int.pco", "vortex.float.pco"]);
+        assert_eq!(
+            scheme_names(&BtrBlocksCompressorBuilder::default().with_compact()),
+            expected,
+        );
+    }
+
     #[rstest]
     #[case::fsst_missing_codes(&string::FSSTScheme, vec![FSST.id()], false)]
     #[case::fsst_with_codes(&string::FSSTScheme, vec![FSST.id(), VarBin.id()], true)]
