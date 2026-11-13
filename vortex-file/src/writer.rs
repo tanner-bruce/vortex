@@ -14,6 +14,7 @@ use async_channel::bounded;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::mpsc;
 use futures::future::Fuse;
 use futures::future::LocalBoxFuture;
 use futures::future::ready;
@@ -362,7 +363,7 @@ impl VortexWriteOptions {
         // stream. It holds no segment of its own: while the output writes one segment, the sink
         // holds at most the next, so a stalled output retains no more input than when the channel
         // carried buffers.
-        let (send, recv_stream) = futures::channel::mpsc::channel(0);
+        let (send, recv_stream) = mpsc::channel(0);
 
         let segments = Arc::new(BufferedSegmentSink::new(send, position));
         let recycle = segments.recycler();

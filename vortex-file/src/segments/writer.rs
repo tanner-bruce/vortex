@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use futures::SinkExt;
+use futures::channel::mpsc::Sender;
 use parking_lot::Mutex;
 use vortex_buffer::segment::Segment;
 use vortex_error::VortexResult;
@@ -22,7 +23,7 @@ use crate::footer::SegmentSpec;
 const MAX_RECYCLED_SEGMENTS: usize = 8;
 
 pub struct BufferedSegmentSink {
-    segments: futures::channel::mpsc::Sender<Segment>,
+    segments: Sender<Segment>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
     recycled: SegmentRecycler,
@@ -52,7 +53,7 @@ impl SegmentRecycler {
 }
 
 impl BufferedSegmentSink {
-    pub fn new(send: futures::channel::mpsc::Sender<Segment>, byte_offset: u64) -> Self {
+    pub fn new(send: Sender<Segment>, byte_offset: u64) -> Self {
         Self {
             segments: send,
             byte_offset: AtomicU64::new(byte_offset),
