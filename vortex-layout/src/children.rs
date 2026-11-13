@@ -55,7 +55,8 @@ pub trait LayoutChildren: 'static + Send + Sync {
         Ok(())
     }
 
-    /// Rebuild the owner node from the same verified flatbuffer with empty child caches.
+    /// Rebuild the owner node from the same verified flatbuffer with an independent child cache.
+    /// Struct leaves the new cache empty; Zoned populates it eagerly during deserialization.
     /// Returns `None` when these children are not flatbuffer-backed.
     fn rebuild_owner(&self, _dtype: &DType) -> Option<VortexResult<LayoutRef>> {
         None

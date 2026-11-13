@@ -266,7 +266,8 @@ pub trait DynLayout: 'static + Send + Sync + Debug {
         let ids = self.dyn_segment_ids();
         cx.enter_materialised(self, &ids)
     }
-    /// Rebuild this node with empty child caches, where backed by a verified flatbuffer.
+    /// Rebuild this node with an independent child cache, where backed by a verified flatbuffer.
+    /// Struct leaves the new cache empty; Zoned populates it eagerly during deserialization.
     fn dyn_rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
         None
     }
@@ -500,7 +501,8 @@ impl dyn DynLayout + '_ {
     ) -> VortexResult<()> {
         VisitCx::new(visitor, stats).materialised(self)
     }
-    /// Rebuild this node from its verified flatbuffer with empty child caches.
+    /// Rebuild this node from its verified flatbuffer with an independent child cache.
+    /// Struct leaves the new cache empty; layouts such as Zoned populate it eagerly.
     /// Returns `None` for layouts whose children are not flatbuffer-backed.
     pub fn rebuild_uncached(&self) -> Option<VortexResult<LayoutRef>> {
         self.dyn_rebuild_uncached()

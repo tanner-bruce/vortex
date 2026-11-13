@@ -159,7 +159,10 @@ impl Footer {
         })
     }
 
-    /// Rebuild the root from the same verified flatbuffer with empty child caches.
+    /// Rebuild the root from the same verified flatbuffer with an independent child cache.
+    ///
+    /// Struct roots leave the new cache empty. Layouts such as Zoned populate their cache
+    /// eagerly during deserialization.
     ///
     /// The segment map, statistics, metadata, read contexts and approximate byte size
     /// are shared or preserved. Returns `None` for a root that is not flatbuffer-backed.
