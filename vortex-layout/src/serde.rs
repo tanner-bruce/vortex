@@ -47,7 +47,8 @@ pub fn layout_from_flatbuffer_with_options(
 ) -> VortexResult<LayoutRef> {
     let layout_session = session.layouts();
     let layouts = layout_session.registry();
-    let fb_layout = root_with_opts::<layout::Layout>(file_metadata_read_verifier_options(), &flatbuffer)?;
+    let fb_layout =
+        root_with_opts::<layout::Layout>(file_metadata_read_verifier_options(), &flatbuffer)?;
     let encoding_id = layout_ctx
         .resolve(fb_layout.encoding())
         .ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;

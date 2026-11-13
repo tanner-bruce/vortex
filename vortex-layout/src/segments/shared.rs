@@ -88,10 +88,7 @@ mod tests {
         // Add a segment to the test source
         let data = ByteBuffer::from(vec![1, 2, 3, 4]);
         let seq_id = SequenceId::root().downgrade();
-        segments
-            .write(seq_id, segment_of(&data))
-            .await
-            .unwrap();
+        segments.write(seq_id, segment_of(&data)).await.unwrap();
 
         let shared_source = SharedSegmentSource::new(source.clone());
 
@@ -117,10 +114,7 @@ mod tests {
         // Add a segment
         let data = ByteBuffer::from(vec![5, 6, 7, 8]);
         let seq_id = SequenceId::root().downgrade();
-        segments
-            .write(seq_id, segment_of(&data))
-            .await
-            .unwrap();
+        segments.write(seq_id, segment_of(&data)).await.unwrap();
 
         let shared_source = SharedSegmentSource::new(source.clone());
         let id = SegmentId::from(0);

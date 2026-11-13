@@ -32,11 +32,11 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::MAX_POSTSCRIPT_SIZE;
 use crate::VERSION;
+use crate::flatbuffers::footer as fb;
 use crate::footer::SegmentSpec;
 use crate::footer::file_layout::FooterFlatBufferWriter;
 use crate::footer::postscript::Postscript;
 use crate::footer::postscript::PostscriptMetadata;
-use crate::flatbuffers::footer as fb;
 use crate::footer::postscript::PostscriptSegment;
 
 /// Serializes a [`Footer`] into footer buffers and the trailing postscript/EOF marker.
