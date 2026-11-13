@@ -276,7 +276,10 @@ impl BtrBlocksCompressorBuilder {
 
     /// Keeps only schemes whose produced encodings are all in `allowed`.
     pub fn retain_allowed_encodings(mut self, allowed: &HashSet<ArrayId>) -> Self {
-        self.allowed.registered = Some(allowed.clone());
+        match &mut self.allowed.registered {
+            Some(registered) => registered.retain(|id| allowed.contains(id)),
+            None => self.allowed.registered = Some(allowed.clone()),
+        }
         self
     }
 
@@ -327,7 +330,10 @@ mod tests {
     use vortex_array::ArrayId;
     use vortex_array::VTable;
     use vortex_array::arrays::Patched;
+    use vortex_array::arrays::Primitive;
     use vortex_array::arrays::VarBin;
+    use vortex_array::session::ArraySession;
+    use vortex_array::session::ArraySessionExt;
     use vortex_decimal_byte_parts::DecimalByteParts;
     use vortex_decimal_byte_parts::decimal_byte_parts_v1_id;
     use vortex_fastlanes::bitpacked_v1_id;
@@ -433,6 +439,40 @@ mod tests {
         builder.allowed.editions = Some(allowed.into_iter().collect());
 
         assert_eq!(!builder.allowed_schemes().is_empty(), retained);
+    }
+
+    #[test]
+    fn retain_allowed_encodings_never_reopens_prior_restrictions() {
+        let all_ids: HashSet<_> = CompressionSession::default()
+            .schemes()
+            .iter()
+            .flat_map(|scheme| scheme.produced_encodings())
+            .chain([Primitive.id()])
+            .collect();
+        let empty = HashSet::default();
+        let builder = BtrBlocksCompressorBuilder::default()
+            .retain_allowed_encodings(&empty)
+            .retain_allowed_encodings(&all_ids);
+        assert!(scheme_names(&builder).is_empty());
+
+        let session = VortexSession::empty()
+            .with::<CompressionSession>()
+            .with_some(ArraySession::empty());
+        session.arrays().register(Primitive);
+        // Ignore editions here to isolate the registered-ID restriction of from_session.
+        let restricted = BtrBlocksCompressorBuilder::from_session(&session).disable_editions();
+        assert!(scheme_names(&restricted).is_empty());
+        let retained = restricted.clone().retain_allowed_encodings(&all_ids);
+        assert_eq!(retained.allowed.registered, restricted.allowed.registered);
+        assert_eq!(scheme_names(&retained), scheme_names(&restricted));
+        assert!(
+            scheme_names(
+                &restricted
+                    .retain_allowed_encodings(&empty)
+                    .retain_allowed_encodings(&all_ids)
+            )
+            .is_empty()
+        );
     }
 
     #[test]
