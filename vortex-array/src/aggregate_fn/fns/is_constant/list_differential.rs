@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Differential oracle retained from vortex-array 0.86.1's original list loop.
-use half::f16;
 use std::sync::LazyLock;
+
+use half::f16;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;

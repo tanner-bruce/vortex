@@ -7,7 +7,6 @@ use flatbuffers::Follow;
 use flatbuffers::Verifiable;
 use flatbuffers::VerifierOptions;
 use flatbuffers::root_with_opts;
-
 use vortex_array::flatbuffers::FILE_METADATA_VERIFIER_OPTIONS;
 use vortex_array::flatbuffers::FlatBuffer;
 use vortex_array::flatbuffers::FlatBufferRoot;
