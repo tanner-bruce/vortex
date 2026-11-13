@@ -39,6 +39,7 @@ pub fn primitive_dict_builder<T: NativePType>(
     nullability: Nullability,
     constraints: &DictConstraints,
     allocator: BufferAllocatorRef,
+    allow_oversized_first_entry: bool,
 ) -> Box<dyn DictEncoder>
 where
     NativeValue<T>: Hash + Eq,
@@ -58,21 +59,25 @@ where
             nullability,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         max if max <= u16::MAX as u64 => Box::new(PrimitiveDictBuilder::<T, u16>::new_in(
             nullability,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         max if max <= u32::MAX as u64 => Box::new(PrimitiveDictBuilder::<T, u32>::new_in(
             nullability,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
         _ => Box::new(PrimitiveDictBuilder::<T, u64>::new_in(
             nullability,
             constraints,
             allocator,
+            allow_oversized_first_entry,
         )),
     }
 }
@@ -87,6 +92,7 @@ where
         nullability: Nullability,
         constraints: &DictConstraints,
         allocator: BufferAllocatorRef,
+        allow_oversized_first_entry: bool,
     ) -> Self {
         let max_dict_len = constraints
             .max_len
@@ -99,6 +105,7 @@ where
             allocator,
             nullability,
             max_dict_len,
+            allow_oversized_first_entry,
         }
     }
 
@@ -109,7 +116,9 @@ where
             Entry::Occupied(o) => Some(*o.get()),
             Entry::Vacant(vac) => {
                 // Admit the first entry even if it exceeds the budget, so the caller makes progress.
-                if !self.values.is_empty() && self.values.len() >= self.max_dict_len {
+                if !(self.allow_oversized_first_entry && self.values.is_empty())
+                    && self.values.len() >= self.max_dict_len
+                {
                     return None;
                 }
                 let next_code = Code::from_usize(self.values.len()).unwrap_or_else(|| {
@@ -129,7 +138,9 @@ where
             return Some(*code);
         }
 
-        if !self.values.is_empty() && self.values.len() >= self.max_dict_len {
+        if !(self.allow_oversized_first_entry && self.values.is_empty())
+            && self.values.len() >= self.max_dict_len
+        {
             return None;
         }
 
@@ -156,6 +167,7 @@ pub struct PrimitiveDictBuilder<T, Code> {
     values_nulls: BitBufferMut,
     nullability: Nullability,
     max_dict_len: usize,
+    allow_oversized_first_entry: bool,
     allocator: BufferAllocatorRef,
 }
 
@@ -369,7 +381,7 @@ mod tests {
             ..UNCONSTRAINED
         };
         let encoder = match_each_native_ptype!(ptype, |T| {
-            primitive_dict_builder::<T>(nullability, &constraints, ctx.allocator().clone())
+            primitive_dict_builder::<T>(nullability, &constraints, ctx.allocator().clone(), true)
         });
         assert_eq!(encoder.codes_ptype(), expected_codes_ptype);
     }
