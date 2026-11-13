@@ -3626,6 +3626,22 @@ async fn file_reads_and_scans_run_inline_without_spawning() {
             while let Some(array) = stream.next().await {
                 rows += array.unwrap().len();
             }
+            let filtered = file
+                .scan()
+                .unwrap()
+                .with_projection(bind_scan_expr(&file, col("numbers")))
+                .with_filter(bind_scan_expr(&file, gt(col("numbers"), lit(3_u32))))
+                .with_limit(1)
+                .into_array_stream()
+                .unwrap()
+                .read_all()
+                .await
+                .unwrap();
+            assert_arrays_eq!(
+                filtered,
+                buffer![4_u32].into_array(),
+                &mut session.create_execution_ctx()
+            );
             rows
         });
         assert_eq!(rows, 8);
