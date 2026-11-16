@@ -12,6 +12,7 @@ use std::sync::Arc;
 use flatbuffers::InvalidFlatbuffer;
 use flatbuffers::VerifierOptions;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldPath;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::flatbuffers::FILE_METADATA_MAX_DEPTH;
@@ -30,6 +31,7 @@ use vortex_layout::LayoutRef;
 use vortex_layout::flatbuffers::layout as fbl;
 use vortex_layout::layout_children;
 use vortex_layout::layouts::chunked::ChunkedLayout;
+use vortex_layout::layouts::file_stats::AggregateStats;
 use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::session::LayoutSession;
@@ -185,4 +187,54 @@ fn read_limits_are_never_stricter_than_write_limits() {
     assert!(read.max_tables >= default.max_tables);
     assert!(read.max_depth >= default.max_depth);
     assert!(read.max_apparent_size >= default.max_apparent_size);
+}
+
+#[test]
+fn fresh_root_preserves_shared_footer_metadata_and_isolates_child_cache() -> VortexResult<()> {
+    let mut footer = read(write(
+        footer_with_flat_chunks(3)?,
+        FILE_METADATA_VERIFIER_OPTIONS,
+    )?)?;
+    footer.layout().slot(0)?;
+    assert_eq!(footer.layout().cached_children(), 1);
+    footer.statistics = Some(crate::FileStatistics::new(
+        Arc::from([AggregateStats::default()]),
+        Arc::from([dtype()]),
+        Arc::from([FieldPath::root()]),
+    ));
+    let metadata_segment = footer.segments[0];
+    let footer =
+        footer.with_metadata_segments(Arc::from([("test.metadata".to_owned(), metadata_segment)]));
+    let fresh = footer.with_fresh_root()?.expect("viewed root");
+    assert_eq!(fresh.layout().cached_children(), 0);
+    assert_eq!(footer.layout().cached_children(), 1);
+    assert!(!Arc::ptr_eq(fresh.layout(), footer.layout()));
+    assert!(Arc::ptr_eq(fresh.segment_map(), footer.segment_map()));
+    assert!(Arc::ptr_eq(&fresh.metadata, &footer.metadata));
+    assert!(Arc::ptr_eq(
+        &fresh.segment_specs_with_metadata(),
+        &footer.segment_specs_with_metadata()
+    ));
+    assert_eq!(fresh.segments_end(), footer.segments_end());
+    assert!(std::ptr::eq(
+        fresh.array_read_ctx.ids(),
+        footer.array_read_ctx.ids()
+    ));
+    assert_eq!(fresh.approx_byte_size(), footer.approx_byte_size());
+    let old_stats = footer.statistics().expect("statistics");
+    let new_stats = fresh.statistics().expect("statistics");
+    assert!(Arc::ptr_eq(old_stats.aggregates(), new_stats.aggregates()));
+    assert!(Arc::ptr_eq(old_stats.dtypes(), new_stats.dtypes()));
+    assert!(Arc::ptr_eq(old_stats.paths(), new_stats.paths()));
+    assert_eq!(fresh.layout().dtype(), footer.layout().dtype());
+    assert_eq!(fresh.layout().row_count(), footer.layout().row_count());
+    assert_eq!(fresh.layout().segment_ids(), footer.layout().segment_ids());
+    assert_eq!(fresh.layout().nchildren(), footer.layout().nchildren());
+    Ok(())
+}
+
+#[test]
+fn fresh_root_returns_none_for_owned_footer() -> VortexResult<()> {
+    assert!(footer_with_flat_chunks(3)?.with_fresh_root()?.is_none());
+    Ok(())
 }

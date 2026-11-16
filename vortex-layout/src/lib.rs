@@ -25,6 +25,7 @@ pub use reader::*;
 pub use reader_context::*;
 pub use serde::*;
 pub use strategy::*;
+pub use visit::*;
 use vortex_session::registry::Interner;
 pub use vtable::*;
 pub mod aliases;
@@ -44,6 +45,7 @@ pub mod session;
 mod strategy;
 #[cfg(test)]
 mod test;
+mod visit;
 mod vtable;
 
 pub type LayoutContext = Interner;
