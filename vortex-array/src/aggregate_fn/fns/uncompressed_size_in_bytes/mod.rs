@@ -877,7 +877,7 @@ mod tests {
             assert_eq!(
                 validity_uncompressed_size_in_bytes(Mask::AllFalse(len))
                     .vortex_expect("valid mask"),
-                ConstantArray::new(false, len).nbytes() as u64,
+                ConstantArray::new(false, len).nbytes(),
             );
         }
     }
