@@ -27,6 +27,7 @@ use vortex_array::expr::stats::Stat;
 use vortex_array::serde::SerializeOptions;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
@@ -61,7 +62,7 @@ const OUT_OF_LINE: &str = "an outlined string for the exact size test";
 )]
 #[case::varbin_slice(
     VarBinArray::from_iter([Some("prefix"), None, Some(OUT_OF_LINE), Some("suffix")], UTF8)
-        .into_array().slice(1..3).unwrap()
+        .into_array().slice(1..3).vortex_expect("slice is within the fixture")
 )]
 #[case::views(
     VarBinViewArray::from_iter_nullable_str([Some("inline"), None, Some(OUT_OF_LINE)])
@@ -71,13 +72,13 @@ const OUT_OF_LINE: &str = "an outlined string for the exact size test";
 #[case::views_slice({
     let unused = "x".repeat(8192);
     VarBinViewArray::from_iter_str([unused.as_str(), OUT_OF_LINE, "inline", unused.as_str()])
-        .into_array().slice(1..3).unwrap()
+        .into_array().slice(1..3).vortex_expect("slice is within the fixture")
 })]
 #[case::dictionary(
     DictArray::try_new(
         PrimitiveArray::from_iter([0u32, 2, 0, 2, 2]).into_array(),
         VarBinViewArray::from_iter_str([OUT_OF_LINE, "unreferenced", "short"]).into_array(),
-    ).unwrap().into_array()
+    ).vortex_expect("the dictionary codes reference existing strings").into_array()
 )]
 #[case::constant(ConstantArray::new(OUT_OF_LINE.to_owned(), 43).into_array())]
 fn exact_size_survives_canonicalization(#[case] input: ArrayRef) -> VortexResult<()> {
