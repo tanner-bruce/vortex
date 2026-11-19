@@ -3,6 +3,7 @@
 
 //! Check exact size and encoded bytes across the cascade's canonicalization.
 
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use rstest::rstest;
@@ -192,10 +193,11 @@ fn chunked_size_and_compression_match_baseline(
     assert_eq!(size, fresh_size);
 
     // The baseline checkout runs this same fixture and compares the full wire bytes.
-    let wire = bytes
-        .iter()
-        .flat_map(|buffer| buffer.as_slice().iter().copied())
-        .collect::<Vec<_>>();
-    eprintln!("VORTEX_CASCADE_PARITY {case} {split_size} {size} {encodings:?} {wire:02x?}");
+    let mut wire = String::new();
+    for byte in bytes.iter().flat_map(|buffer| buffer.as_slice()) {
+        write!(wire, "{byte:02x}").vortex_expect("writing to a String cannot fail");
+    }
+    let encodings = encodings.join(",");
+    eprintln!("VORTEX_CASCADE_PARITY {case} {split_size} {size} {encodings} {wire}");
     Ok(())
 }
