@@ -129,10 +129,13 @@ fn chunked<T: NativePType>(rows: impl IntoIterator<Item = Option<T>>) -> VortexR
     .map(IntoArray::into_array)
 }
 
+/// The extension case compares storage size and wire bytes. The unrestricted carry also
+/// passes this case because compression measures the extension storage again.
 #[rstest]
 #[case::chunked("chunked", 32, 18)]
 #[case::struct_field("struct", 32, 18)]
 #[case::extension_storage("extension", 80, 66)]
+#[case::dict_values("dict", 32, 18)]
 fn chunked_size_and_compression_match_baseline(
     #[case] case: &str,
     #[case] split_size: usize,
@@ -151,6 +154,14 @@ fn chunked_size_and_compression_match_baseline(
                 PrimitiveArray::from_option_iter(rows()).into_array(),
             )])?
             .into_array(),
+        ),
+        "dict" => (
+            DictArray::try_new(
+                PrimitiveArray::from_iter(0..16u32).into_array(),
+                chunked(rows())?,
+            )?
+            .into_array(),
+            PrimitiveArray::from_option_iter(rows()).into_array(),
         ),
         "extension" => {
             let rows = || rows().map(|row| row.map(i32::from));
