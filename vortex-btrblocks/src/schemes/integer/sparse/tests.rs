@@ -5,6 +5,7 @@
 
 use std::fmt::Write as _;
 
+use rstest::rstest;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
@@ -135,12 +136,23 @@ fn sparse_scheme_preserves_baseline_bytes() -> VortexResult<()> {
         )+};
     }
     check!(u8, u16, u32, u64, i8, i16, i32, i64);
+    Ok(())
+}
 
-    let tie = PrimitiveArray::from_iter((0..256u64).map(|i| 1 + i % 2));
+#[rstest]
+#[case::one_and_two(&[1, 2], 1, "u64-forced-tied")]
+#[case::zero_and_one(&[0, 1], 1, "u64-forced-tied-01")]
+#[case::five_through_eight(&[5, 6, 7, 8], 8, "u64-forced-tied-5678")]
+fn sparse_scheme_preserves_baseline_bytes_for_ties(
+    #[case] values: &[u64],
+    #[case] expected_fill: u64,
+    #[case] name: &str,
+) -> VortexResult<()> {
+    let tie = PrimitiveArray::from_iter((0..256).map(|i| values[i % values.len()]));
     report_sparse(
-        "u64-forced-tied",
+        name,
         tie.into_array(),
-        Scalar::primitive(1u64, Nullability::NonNullable),
+        Scalar::primitive(expected_fill, Nullability::NonNullable),
         &SparseOnTie,
     )
 }
