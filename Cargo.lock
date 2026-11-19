@@ -11697,7 +11697,6 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-session",
- "vortex-sparse",
  "vortex-utils",
 ]
 

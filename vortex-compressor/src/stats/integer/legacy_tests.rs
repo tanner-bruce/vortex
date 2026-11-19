@@ -24,9 +24,9 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
-use vortex_sparse::Sparse;
 use vortex_utils::aliases::hash_map::HashMap;
 
+use super::DistinctCounter;
 use super::DistinctInfo;
 use super::DistinctValues;
 use super::ErasedStats;
@@ -34,11 +34,7 @@ use super::TypedStats;
 use super::typed_int_stats;
 use crate::builtins::integer_dictionary_encode;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty();
-    vortex_sparse::initialize(&session);
-    session
-});
+static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
 struct LegacyDistinctInfo<T> {
     distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
@@ -273,17 +269,6 @@ where
         expected_dict.serialize(&array_ctx, &SESSION, &options)?,
     );
 
-    // Sparse uses the top value as its fill, including heavy ties when most rows are null.
-    let array = array.into_array();
-    let fill =
-        |value| Scalar::primitive_value(PValue::from(value), T::PTYPE, array.dtype().nullability());
-    let actual_sparse = Sparse::encode(&array, Some(fill(actual_top)), &mut ctx)?;
-    let expected_sparse =
-        Sparse::encode(&array, Some(fill(expected.most_frequent_value)), &mut ctx)?;
-    assert_eq!(
-        actual_sparse.serialize(&array_ctx, &SESSION, &options)?,
-        expected_sparse.serialize(&array_ctx, &SESSION, &options)?,
-    );
     Ok(())
 }
 
@@ -363,3 +348,38 @@ legacy_case!(matches_legacy_i8, I8);
 legacy_case!(matches_legacy_i16, I16);
 legacy_case!(matches_legacy_i32, I32);
 legacy_case!(matches_legacy_i64, I64);
+
+#[test]
+fn matches_legacy_for_the_full_u16_tie() -> VortexResult<()> {
+    let values: Vec<_> = (0..=u16::MAX).collect();
+    let valid = vec![true; values.len()];
+    compare(values, &valid, Validity::NonNullable, |stats| {
+        let ErasedStats::U16(typed) = stats else {
+            unreachable!()
+        };
+        typed
+    })
+}
+
+#[test]
+fn matches_legacy_across_the_dense_range_boundary() -> VortexResult<()> {
+    const LIMIT: u32 = 65_536;
+    let valid = vec![true; LIMIT as usize];
+    for (max, dense) in [(LIMIT - 1, true), (LIMIT, false)] {
+        let values: Vec<_> = (0..LIMIT - 1).chain([max]).collect();
+        assert_eq!(
+            matches!(
+                DistinctCounter::new(0u32, max, values.len()),
+                DistinctCounter::Dense { .. }
+            ),
+            dense,
+        );
+        compare(values, &valid, Validity::NonNullable, |stats| {
+            let ErasedStats::U32(typed) = stats else {
+                unreachable!()
+            };
+            typed
+        })?;
+    }
+    Ok(())
+}
