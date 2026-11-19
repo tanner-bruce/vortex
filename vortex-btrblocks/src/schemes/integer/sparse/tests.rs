@@ -4,10 +4,12 @@
 //! Compare the real Sparse scheme's serialized output across fork revisions.
 
 use std::fmt::Write as _;
-use std::sync::LazyLock;
 
 use vortex_array::ArrayContext;
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
+use vortex_array::Canonical;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
@@ -15,6 +17,9 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::Nullability;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::SerializeOptions;
+use vortex_compressor::scheme::CompressionEstimate;
+use vortex_compressor::scheme::DescendantExclusion;
+use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
@@ -22,23 +27,71 @@ use vortex_sparse::Sparse;
 use vortex_sparse::SparseExt as _;
 
 use super::SparseScheme;
+use crate::ArrayAndStats;
 use crate::CascadingCompressor;
-use crate::PinSpec;
-use crate::SchemePins;
+use crate::CompressorContext;
+use crate::GenerateStatsOptions;
+use crate::Scheme;
+
+/// Admits a tie so the test can inspect the fill chosen by the real Sparse encoder.
+#[derive(Debug)]
+struct SparseOnTie;
+
+impl Scheme for SparseOnTie {
+    fn scheme_name(&self) -> &'static str {
+        SparseScheme.scheme_name()
+    }
+
+    fn matches(&self, canonical: &Canonical) -> bool {
+        SparseScheme.matches(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        SparseScheme.produced_encodings()
+    }
+
+    fn stats_options(&self) -> GenerateStatsOptions {
+        SparseScheme.stats_options()
+    }
+
+    fn num_children(&self) -> usize {
+        SparseScheme.num_children()
+    }
+
+    fn descendant_exclusions(&self) -> Vec<DescendantExclusion> {
+        SparseScheme.descendant_exclusions()
+    }
+
+    fn expected_compression_ratio(
+        &self,
+        _data: &ArrayAndStats,
+        _ctx: CompressorContext,
+        _exec: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse)
+    }
+
+    fn compress(
+        &self,
+        compressor: &CascadingCompressor,
+        data: &ArrayAndStats,
+        ctx: CompressorContext,
+        exec: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        SparseScheme.compress(compressor, data, ctx, exec)
+    }
+}
 
 fn report_sparse(
     name: &str,
     array: ArrayRef,
     fill: Scalar,
-    pins: Option<&'static SchemePins>,
+    scheme: &'static dyn Scheme,
 ) -> VortexResult<()> {
     let session = VortexSession::empty();
     vortex_sparse::initialize(&session);
     let mut ctx = session.create_execution_ctx();
-    let mut compressor = CascadingCompressor::new(vec![&SparseScheme]);
-    if let Some(pins) = pins {
-        compressor = compressor.with_pins(pins);
-    }
+    let compressor = CascadingCompressor::new(vec![scheme]);
     let compressed = compressor.compress(&array, &mut ctx)?;
     let sparse = compressed
         .as_opt::<Sparse>()
@@ -72,35 +125,23 @@ fn sparse_scheme_preserves_baseline_bytes() -> VortexResult<()> {
                 _ => None,
             })).into_array();
             let null_fill = Scalar::null(tied.dtype().clone());
-            report_sparse(concat!(stringify!($ty), "-tied"), tied, null_fill, None)?;
+            report_sparse(concat!(stringify!($ty), "-tied"), tied, null_fill, &SparseScheme)?;
             let dominant = PrimitiveArray::from_iter((0..256).map(|index| {
                 if index % 23 == 0 { two } else { one }
             })).into_array();
             report_sparse(
                 concat!(stringify!($ty), "-dominant"), dominant,
-                Scalar::primitive(one, Nullability::NonNullable), None,
+                Scalar::primitive(one, Nullability::NonNullable), &SparseScheme,
             )?;
         )+};
     }
     check!(u8, u16, u32, u64, i8, i16, i32, i64);
 
-    // Pin Sparse so it encodes a two-way tie without the null-dominated fill overriding the winner.
-    static PINS: LazyLock<SchemePins> = LazyLock::new(|| {
-        SchemePins::new(
-            &CascadingCompressor::new(vec![&SparseScheme]),
-            &[PinSpec {
-                path: &[],
-                history: &[],
-                decision: Some("vortex.int.sparse"),
-            }],
-        )
-        .vortex_expect("the root Sparse pin resolves")
-    });
-    let pinned_tie = PrimitiveArray::from_iter((0..256u64).map(|i| 1 + i % 2));
+    let tie = PrimitiveArray::from_iter((0..256u64).map(|i| 1 + i % 2));
     report_sparse(
-        "u64-pinned-tied",
-        pinned_tie.into_array(),
+        "u64-forced-tied",
+        tie.into_array(),
         Scalar::primitive(1u64, Nullability::NonNullable),
-        Some(&PINS),
+        &SparseOnTie,
     )
 }
