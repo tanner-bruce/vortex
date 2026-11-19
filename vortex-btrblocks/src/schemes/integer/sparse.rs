@@ -108,12 +108,9 @@ impl Scheme for SparseScheme {
             return CompressionEstimate::Verdict(EstimateVerdict::Ratio(len / value_count as f64));
         }
 
-        let (_, most_frequent_count) = stats
-            .erased()
-            .most_frequent_value_and_count()
-            .vortex_expect(
-                "this must be present since `SparseScheme` declared that we need distinct values",
-            );
+        let most_frequent_count = stats.erased().top_frequency().vortex_expect(
+            "this must be present since `SparseScheme` declared that we need distinct values",
+        );
 
         // If the most frequent value is the only value, we should compress as constant instead.
         if most_frequent_count == value_count {
