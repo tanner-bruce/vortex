@@ -3,6 +3,7 @@
 
 pub(crate) mod rules;
 mod slice;
+pub(crate) mod uncompressed_size;
 
 mod cast;
 mod compare;

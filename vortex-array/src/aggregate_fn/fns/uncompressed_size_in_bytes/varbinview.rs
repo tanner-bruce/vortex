@@ -48,9 +48,10 @@ fn referenced_data_size(views: &[BinaryView], validity: &Mask) -> u64 {
         Mask::AllTrue(_) => views.iter().filter_map(out_of_line).sum(),
         Mask::AllFalse(_) => 0,
         Mask::Values(values) => values
-            .indices()
+            .bit_buffer()
             .iter()
-            .filter_map(|&row| out_of_line(&views[row]))
+            .zip(views)
+            .filter_map(|(valid, view)| if valid { out_of_line(view) } else { None })
             .sum(),
     }
 }
