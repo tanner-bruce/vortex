@@ -36,7 +36,6 @@ use vortex_array::dtype::PType;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProvider;
-use vortex_array::match_each_canonical;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -231,11 +230,23 @@ impl CascadingCompressor {
         if let Precision::Exact(size) = size
             && let Some(size) = size.into_value()
         {
-            match_each_canonical!(&canonical, |array| {
-                array
-                    .statistics()
-                    .set(Stat::UncompressedSizeInBytes, Precision::Exact(size))
-            });
+            let array: &ArrayRef = match &canonical {
+                Canonical::Null(array) => array.as_ref(),
+                Canonical::Bool(array) => array.as_ref(),
+                Canonical::Primitive(array) => array.as_ref(),
+                Canonical::Decimal(array) => array.as_ref(),
+                Canonical::VarBinView(array) => array.as_ref(),
+                Canonical::List(array) => array.as_ref(),
+                Canonical::Map(array) => array.as_ref(),
+                Canonical::FixedSizeList(array) => array.as_ref(),
+                Canonical::Struct(array) => array.as_ref(),
+                Canonical::Union(array) => array.as_ref(),
+                Canonical::Variant(array) => array.as_ref(),
+                Canonical::Extension(array) => array.as_ref(),
+            };
+            array
+                .statistics()
+                .set(Stat::UncompressedSizeInBytes, Precision::Exact(size));
         }
         self.compress_canonical(canonical, compress_ctx, exec_ctx)
     }
