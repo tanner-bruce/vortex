@@ -33,6 +33,10 @@ use vortex_array::arrays::union::UnionArrayExt;
 use vortex_array::arrays::union::UnionArraySlotsExt;
 use vortex_array::arrays::variant::VariantArraySlotsExt;
 use vortex_array::dtype::PType;
+use vortex_array::expr::stats::Precision;
+use vortex_array::expr::stats::Stat;
+use vortex_array::expr::stats::StatsProvider;
+use vortex_array::match_each_canonical;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -219,8 +223,21 @@ impl CascadingCompressor {
                     .map(Selection::into_array);
             }
         }
+        let size = array.statistics().get(Stat::UncompressedSizeInBytes);
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
-        self.compress_canonical(canonical.compact(exec_ctx)?, compress_ctx, exec_ctx)
+        let canonical = canonical.compact(exec_ctx)?;
+        // Normalizing validity and compacting buffers preserve the logical rows counted by
+        // the size statistic. Carry it across the fresh array so selection can reuse it.
+        if let Precision::Exact(size) = size
+            && let Some(size) = size.into_value()
+        {
+            match_each_canonical!(&canonical, |array| {
+                array
+                    .statistics()
+                    .set(Stat::UncompressedSizeInBytes, Precision::Exact(size))
+            });
+        }
+        self.compress_canonical(canonical, compress_ctx, exec_ctx)
     }
 
     /// Compresses a canonical array by dispatching to type-specific logic.
@@ -717,3 +734,6 @@ enum Planned {
     /// Leave the array canonical, as its pin says; counted as pinned.
     Canonical,
 }
+
+#[cfg(test)]
+mod tests;
