@@ -195,7 +195,7 @@ fn chunked_size_and_compression_match_baseline(
     // The baseline checkout runs this same fixture and compares the full wire bytes.
     let mut wire = String::new();
     for byte in bytes.iter().flat_map(|buffer| buffer.as_slice()) {
-        write!(wire, "{byte:02x}").vortex_expect("writing to a String cannot fail");
+        assert!(write!(wire, "{byte:02x}").is_ok());
     }
     let encodings = encodings.join(",");
     eprintln!("VORTEX_CASCADE_PARITY {case} {split_size} {size} {encodings} {wire}");
