@@ -15,19 +15,14 @@ use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
 
 use super::SparseScheme;
-use crate::ArrayAndStats;
 use crate::CascadingCompressor;
-use crate::CompressorContext;
-use crate::Scheme;
 
 fn report_sparse(name: &str, array: ArrayRef) -> VortexResult<()> {
     let session = VortexSession::empty();
     vortex_sparse::initialize(&session);
     let mut ctx = session.create_execution_ctx();
-    let compressor = CascadingCompressor::new(Vec::new());
-    let data = ArrayAndStats::new(array.clone(), SparseScheme.stats_options());
-    let compressed =
-        SparseScheme.compress(&compressor, &data, CompressorContext::new(), &mut ctx)?;
+    let compressor = CascadingCompressor::new(vec![&SparseScheme]);
+    let compressed = compressor.compress(&array, &mut ctx)?;
     assert!(compressed.is::<Sparse>());
     assert_arrays_eq!(&array, &compressed, &mut ctx);
 
