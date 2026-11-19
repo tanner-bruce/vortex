@@ -3,6 +3,8 @@
 
 //! Compare the real Sparse scheme's serialized output across fork revisions.
 
+use std::fmt::Write as _;
+
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
@@ -10,6 +12,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::serde::SerializeOptions;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
@@ -31,11 +34,11 @@ fn report_sparse(name: &str, array: ArrayRef) -> VortexResult<()> {
         &session,
         &SerializeOptions::default(),
     )?;
-    let bytes = buffers
-        .iter()
-        .flat_map(|buffer| buffer.as_slice().iter().copied())
-        .collect::<Vec<_>>();
-    eprintln!("VORTEX_SPARSE_PARITY {name} {bytes:02x?}");
+    let mut bytes = String::new();
+    for byte in buffers.iter().flat_map(|buffer| buffer.as_slice()) {
+        write!(bytes, "{byte:02x}").vortex_expect("writing to a String cannot fail");
+    }
+    eprintln!("VORTEX_SPARSE_PARITY {name} {bytes}");
     Ok(())
 }
 
