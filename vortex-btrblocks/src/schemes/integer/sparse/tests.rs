@@ -12,7 +12,6 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::serde::SerializeOptions;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
@@ -36,7 +35,7 @@ fn report_sparse(name: &str, array: ArrayRef) -> VortexResult<()> {
     )?;
     let mut bytes = String::new();
     for byte in buffers.iter().flat_map(|buffer| buffer.as_slice()) {
-        write!(bytes, "{byte:02x}").vortex_expect("writing to a String cannot fail");
+        assert!(write!(bytes, "{byte:02x}").is_ok());
     }
     eprintln!("VORTEX_SPARSE_PARITY {name} {bytes}");
     Ok(())
