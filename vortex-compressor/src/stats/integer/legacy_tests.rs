@@ -34,7 +34,11 @@ use super::TypedStats;
 use super::typed_int_stats;
 use crate::builtins::integer_dictionary_encode;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = VortexSession::empty();
+    vortex_sparse::initialize(&session);
+    session
+});
 
 struct LegacyDistinctInfo<T> {
     distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
@@ -82,6 +86,10 @@ mod legacy {
     /// Accumulates the occurrences of each distinct valid value.
     enum DistinctCounter<T> {
         /// Distinct values are not being counted.
+        #[expect(
+            dead_code,
+            reason = "preserve the legacy counter; this test uses counting"
+        )]
         Off,
         /// Counts indexed by `value - min`, used when the value range is narrow. This avoids hashing
         /// entirely.
