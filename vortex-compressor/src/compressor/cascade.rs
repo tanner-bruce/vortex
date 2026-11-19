@@ -227,16 +227,15 @@ impl CascadingCompressor {
                     .map(Selection::into_array);
             }
         }
-        // These encodings measure the same logical rows and validity bytes as their canonical
-        // representation. Other encodings may measure their children separately before compaction.
+        // Carry the direct measure of canonical leaves, constants, and VarBin. An encoding
+        // that must execute before measurement can expose chunks with separate validity bytes.
         let size = (array.is::<Null>()
             || array.is::<Bool>()
             || array.is::<Primitive>()
             || array.is::<Decimal>()
             || array.is::<VarBinView>()
             || array.is::<VarBin>()
-            || array.is::<Constant>()
-            || array.is::<Dict>())
+            || array.is::<Constant>())
         .then(|| array.statistics().get(Stat::UncompressedSizeInBytes));
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
         let canonical = canonical.compact(exec_ctx)?;
