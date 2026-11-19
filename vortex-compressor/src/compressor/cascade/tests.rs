@@ -122,8 +122,7 @@ fn exact_size_survives_canonicalization(#[case] input: ArrayRef) -> VortexResult
 fn chunked<T: NativePType>(rows: impl IntoIterator<Item = Option<T>>) -> VortexResult<ArrayRef> {
     ChunkedArray::try_new(
         rows.into_iter()
-            .map(|row| PrimitiveArray::from_option_iter([row]).into_array())
-            .collect(),
+            .map(|row| PrimitiveArray::from_option_iter([row]).into_array()),
         DType::Primitive(T::PTYPE, Nullability::Nullable),
     )
     .map(IntoArray::into_array)
