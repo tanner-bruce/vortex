@@ -13,17 +13,23 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::DictArray;
+use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
+use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::stats::Precision;
 use vortex_array::expr::stats::Stat;
+use vortex_array::extension::datetime::Date;
+use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::serde::SerializeOptions;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
@@ -110,5 +116,87 @@ fn exact_size_survives_canonicalization(#[case] input: ArrayRef) -> VortexResult
         measured.serialize(&context, &SESSION, &options)?,
         carried.serialize(&context, &SESSION, &options)?,
     );
+    Ok(())
+}
+
+fn chunked<T: NativePType>(rows: impl IntoIterator<Item = Option<T>>) -> VortexResult<ArrayRef> {
+    ChunkedArray::try_new(
+        rows.into_iter()
+            .map(|row| PrimitiveArray::from_option_iter([row]).into_array())
+            .collect(),
+        DType::Primitive(T::PTYPE, Nullability::Nullable),
+    )
+    .map(IntoArray::into_array)
+}
+
+#[rstest]
+#[case::chunked("chunked", 32, 18)]
+#[case::struct_field("struct", 32, 18)]
+#[case::extension_storage("extension", 80, 66)]
+fn chunked_size_and_compression_match_baseline(
+    #[case] case: &str,
+    #[case] split_size: usize,
+    #[case] fresh_size: usize,
+) -> VortexResult<()> {
+    let rows = || (0..16u8).map(|i| (i % 2 == 0).then_some(i % 4));
+    let (input, flat) = match case {
+        "chunked" => (
+            chunked(rows())?,
+            PrimitiveArray::from_option_iter(rows()).into_array(),
+        ),
+        "struct" => (
+            StructArray::from_fields(&[("field", chunked(rows())?)])?.into_array(),
+            StructArray::from_fields(&[(
+                "field",
+                PrimitiveArray::from_option_iter(rows()).into_array(),
+            )])?
+            .into_array(),
+        ),
+        "extension" => {
+            let rows = || rows().map(|row| row.map(i32::from));
+            let dtype = Date::new(TimeUnit::Days, Nullability::Nullable).erased();
+            (
+                ExtensionArray::new(dtype.clone(), chunked(rows())?).into_array(),
+                ExtensionArray::new(dtype, PrimitiveArray::from_option_iter(rows()).into_array())
+                    .into_array(),
+            )
+        }
+        _ => unreachable!("unknown compression fixture"),
+    };
+
+    let mut ctx = SESSION.create_execution_ctx();
+    assert_eq!(uncompressed_size_in_bytes(&input, &mut ctx)?, split_size);
+    let compressor = CascadingCompressor::new(vec![&IntDictScheme, &StringDictScheme]);
+    let encoded = compressor.compress(&input, &mut ctx)?;
+    let flat_encoded = compressor.compress(&flat, &mut ctx)?;
+    let encoding_ids = |array: &ArrayRef| {
+        array
+            .depth_first_traversal()
+            .map(|child| child.encoding_id().to_string())
+            .collect::<Vec<_>>()
+    };
+    let encodings = encoding_ids(&encoded);
+    assert_eq!(encodings, encoding_ids(&flat_encoded));
+
+    let context = ArrayContext::empty();
+    let options = SerializeOptions::default();
+    let bytes = encoded.serialize(&context, &SESSION, &options)?;
+    assert_eq!(bytes, flat_encoded.serialize(&context, &SESSION, &options)?);
+
+    let canonical = flat
+        .execute::<CanonicalValidity>(&mut ctx)?
+        .0
+        .compact(&mut ctx)?
+        .into_array();
+    canonical.statistics().clear(Stat::UncompressedSizeInBytes);
+    let size = uncompressed_size_in_bytes(&canonical, &mut ctx)?;
+    assert_eq!(size, fresh_size);
+
+    // The baseline checkout runs this same fixture and compares the full wire bytes.
+    let wire = bytes
+        .iter()
+        .flat_map(|buffer| buffer.as_slice().iter().copied())
+        .collect::<Vec<_>>();
+    eprintln!("VORTEX_CASCADE_PARITY {case} {split_size} {size} {encodings:?} {wire:02x?}");
     Ok(())
 }

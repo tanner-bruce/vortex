@@ -10,15 +10,20 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
+use vortex_array::arrays::Bool;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Decimal;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Masked;
+use vortex_array::arrays::Null;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::UnionArray;
+use vortex_array::arrays::VarBin;
+use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
 use vortex_array::arrays::dict::DictArraySlotsExt;
@@ -222,12 +227,20 @@ impl CascadingCompressor {
                     .map(Selection::into_array);
             }
         }
-        let size = array.statistics().get(Stat::UncompressedSizeInBytes);
+        // These encodings measure the same logical rows and validity bytes as their canonical
+        // representation. Other encodings may measure their children separately before compaction.
+        let size = (array.is::<Null>()
+            || array.is::<Bool>()
+            || array.is::<Primitive>()
+            || array.is::<Decimal>()
+            || array.is::<VarBinView>()
+            || array.is::<VarBin>()
+            || array.is::<Constant>()
+            || array.is::<Dict>())
+        .then(|| array.statistics().get(Stat::UncompressedSizeInBytes));
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
         let canonical = canonical.compact(exec_ctx)?;
-        // Normalizing validity and compacting buffers preserve the logical rows counted by
-        // the size statistic. Carry it across the fresh array so selection can reuse it.
-        if let Precision::Exact(size) = size
+        if let Some(Precision::Exact(size)) = size
             && let Some(size) = size.into_value()
         {
             let array: &ArrayRef = match &canonical {
