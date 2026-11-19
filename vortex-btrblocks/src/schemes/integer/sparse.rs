@@ -213,3 +213,6 @@ impl Scheme for SparseScheme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
