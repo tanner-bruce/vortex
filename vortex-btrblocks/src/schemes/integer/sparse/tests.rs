@@ -24,7 +24,6 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_sparse::Sparse;
-use vortex_sparse::SparseExt as _;
 
 use super::SparseScheme;
 use crate::ArrayAndStats;
