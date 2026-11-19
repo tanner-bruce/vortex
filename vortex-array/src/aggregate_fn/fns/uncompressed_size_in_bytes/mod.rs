@@ -376,8 +376,10 @@ mod tests {
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_mask::Mask;
     use vortex_session::VortexSession;
 
+    use super::validity_uncompressed_size_in_bytes;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::RecursiveCanonical;
@@ -867,5 +869,16 @@ mod tests {
         let result = UncompressedSizeInBytes.to_scalar(dtypes.args(&opts), &state)?;
         assert_eq!(result.as_primitive().typed_value::<u64>(), Some(8));
         Ok(())
+    }
+
+    #[test]
+    fn all_false_validity_matches_constant_array() {
+        for len in [1, 7, 8, 9, 63, 64, 65, 65_536] {
+            assert_eq!(
+                validity_uncompressed_size_in_bytes(Mask::AllFalse(len))
+                    .vortex_expect("valid mask"),
+                ConstantArray::new(false, len).nbytes() as u64,
+            );
+        }
     }
 }
