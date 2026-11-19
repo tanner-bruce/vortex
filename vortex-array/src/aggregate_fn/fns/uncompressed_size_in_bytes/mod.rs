@@ -21,6 +21,7 @@ use fixed_size_list::fixed_size_list_uncompressed_size_in_bytes;
 use list_view::list_view_uncompressed_size_in_bytes;
 use null::null_uncompressed_size_in_bytes;
 use primitive::primitive_uncompressed_size_in_bytes;
+use prost::Message;
 use struct_::struct_uncompressed_size_in_bytes;
 use union::union_uncompressed_size_in_bytes;
 use varbinview::varbinview_uncompressed_size_in_bytes;
@@ -56,6 +57,7 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 
 /// Return the uncompressed size of an array in bytes.
 ///
@@ -352,7 +354,10 @@ fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
 pub(crate) fn validity_uncompressed_size_in_bytes(validity: Mask) -> VortexResult<u64> {
     match validity {
         Mask::AllTrue(_) => Ok(0),
-        Mask::AllFalse(len) => Ok(ConstantArray::new(false, len).into_array().nbytes()),
+        // Match the single protobuf scalar buffer of a constant false validity array.
+        Mask::AllFalse(_) => {
+            Ok(ScalarValue::to_proto(Some(&ScalarValue::Bool(false))).encoded_len() as u64)
+        }
         Mask::Values(values) => packed_bit_buffer_size_in_bytes(values.len()),
     }
 }
