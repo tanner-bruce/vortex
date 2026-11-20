@@ -3,6 +3,7 @@
 
 //! Integer compression statistics.
 
+use std::borrow::Cow;
 use std::hash::Hash;
 
 use num_traits::PrimInt;
@@ -23,23 +24,62 @@ use vortex_utils::aliases::hash_map::HashMap;
 
 use super::GenerateStatsOptions;
 
+/// The map representation used by dictionary encoding and sparse tie-breaking.
+type DistinctMap<T> = HashMap<NativeValue<T>, u32, FxBuildHasher>;
+
+/// Retained counts. Dense pairs are kept in ascending value order.
+#[derive(Debug, Clone)]
+enum DistinctValues<T> {
+    /// Nonzero entries of the dense counter.
+    Dense(Vec<(NativeValue<T>, u32)>),
+    /// The original map for wide ranges.
+    Hashed(DistinctMap<T>),
+}
+
 /// Information about the distinct values in an integer array.
 #[derive(Debug, Clone)]
 pub struct DistinctInfo<T> {
     /// The unique values and their occurrences.
-    distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
-    /// The count of unique values. This _must_ be non-zero.
-    distinct_count: u32,
-    /// The most frequent value.
+    distinct_values: DistinctValues<T>,
+    /// The most frequent value, or one of the tied candidates for dense counts.
     most_frequent_value: T,
+    /// Dense counts defer tie-breaking until the value is requested.
+    top_is_tied: bool,
     /// The number of times the most frequent value occurs.
     top_frequency: u32,
 }
 
-impl<T> DistinctInfo<T> {
-    /// Returns a reference to the distinct values map.
-    pub fn distinct_values(&self) -> &HashMap<NativeValue<T>, u32, FxBuildHasher> {
-        &self.distinct_values
+impl<T: Copy> DistinctInfo<T>
+where
+    NativeValue<T>: Eq + Hash,
+{
+    /// Returns the distinct values map, materializing dense counts when needed.
+    pub fn distinct_values(&self) -> Cow<'_, DistinctMap<T>> {
+        match &self.distinct_values {
+            DistinctValues::Dense(pairs) => {
+                // Dictionary value order and sparse tie-breaking depend on the old map's
+                // insertion and growth history. Start empty and insert in value order.
+                let mut map = DistinctMap::default();
+                for &(value, count) in pairs {
+                    map.insert(value, count);
+                }
+                Cow::Owned(map)
+            }
+            DistinctValues::Hashed(map) => Cow::Borrowed(map),
+        }
+    }
+
+    /// Resolve a dense tie using the original map order and last-maximum rule.
+    fn most_frequent_value(&self) -> T {
+        if !self.top_is_tied {
+            return self.most_frequent_value;
+        }
+        let (&NativeValue(value), _) = self
+            .distinct_values()
+            .iter()
+            .max_by_key(|&(_, &count)| count)
+            .vortex_expect("a tied maximum implies non-empty counts");
+        value
     }
 }
 
@@ -59,18 +99,30 @@ impl<T> TypedStats<T> {
     pub fn distinct(&self) -> Option<&DistinctInfo<T>> {
         self.distinct.as_ref()
     }
-}
 
-impl<T> TypedStats<T> {
     /// Get the count of distinct values, if we have computed it already.
     fn distinct_count(&self) -> Option<u32> {
-        Some(self.distinct.as_ref()?.distinct_count)
+        let count = match &self.distinct.as_ref()?.distinct_values {
+            DistinctValues::Dense(pairs) => pairs.len(),
+            DistinctValues::Hashed(map) => map.len(),
+        };
+        Some(u32::try_from(count).vortex_expect("distinct count cannot exceed the value count"))
     }
 
-    /// Get the most commonly occurring value and its count, if we have computed it already.
-    fn most_frequent_value_and_count(&self) -> Option<(&T, u32)> {
+    /// Read the maximum frequency without resolving ties.
+    fn top_frequency(&self) -> Option<u32> {
+        Some(self.distinct.as_ref()?.top_frequency)
+    }
+}
+
+impl<T: Copy> TypedStats<T>
+where
+    NativeValue<T>: Eq + Hash,
+{
+    /// Get the most frequently occurring value and its count when distinct counting was enabled.
+    fn most_frequent_value_and_count(&self) -> Option<(T, u32)> {
         let distinct = self.distinct.as_ref()?;
-        Some((&distinct.most_frequent_value, distinct.top_frequency))
+        Some((distinct.most_frequent_value(), distinct.top_frequency))
     }
 }
 
@@ -178,40 +230,54 @@ impl ErasedStats {
         }
     }
 
+    /// Get the count of the most frequent value without resolving ties.
+    pub fn top_frequency(&self) -> Option<u32> {
+        match self {
+            ErasedStats::U8(x) => x.top_frequency(),
+            ErasedStats::U16(x) => x.top_frequency(),
+            ErasedStats::U32(x) => x.top_frequency(),
+            ErasedStats::U64(x) => x.top_frequency(),
+            ErasedStats::I8(x) => x.top_frequency(),
+            ErasedStats::I16(x) => x.top_frequency(),
+            ErasedStats::I32(x) => x.top_frequency(),
+            ErasedStats::I64(x) => x.top_frequency(),
+        }
+    }
+
     /// Get the most commonly occurring value and its count.
     pub fn most_frequent_value_and_count(&self) -> Option<(PValue, u32)> {
         match &self {
             ErasedStats::U8(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::U16(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::U32(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::U64(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::I8(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::I16(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::I32(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
             ErasedStats::I64(x) => {
                 let (top_value, count) = x.most_frequent_value_and_count()?;
-                Some(((*top_value).into(), count))
+                Some((top_value.into(), count))
             }
         }
     }
@@ -345,9 +411,9 @@ where
                 min: T::max_value(),
                 max: T::min_value(),
                 distinct: Some(DistinctInfo {
-                    distinct_values: HashMap::with_capacity_and_hasher(0, FxBuildHasher),
-                    distinct_count: 0,
+                    distinct_values: DistinctValues::Hashed(DistinctMap::default()),
                     most_frequent_value: T::zero(),
+                    top_is_tied: false,
                     top_frequency: 0,
                 }),
             }
@@ -519,36 +585,50 @@ where
 
     /// Returns the distinct value information, or `None` if counting was off.
     fn finish(self) -> Option<DistinctInfo<T>> {
-        let distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher> = match self {
-            Self::Off => return None,
+        match self {
+            Self::Off => None,
             Self::Dense { min, counts, .. } => {
                 let min = min.to_i128().vortex_expect("integers fit in i128");
-                counts
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &count)| count > 0)
-                    .map(|(index, &count)| {
-                        let value = <T as num_traits::NumCast>::from(min + index as i128)
-                            .vortex_expect("values between min and max fit in the type");
-                        (NativeValue(value), count)
-                    })
-                    .collect()
+                let mut pairs = Vec::new();
+                let mut top_count = 0;
+                let mut top_value = T::default();
+                let mut top_is_tied = false;
+                for (index, count) in counts.into_iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    let value = <T as num_traits::NumCast>::from(min + index as i128)
+                        .vortex_expect("values between min and max fit in the type");
+                    pairs.push((NativeValue(value), count));
+                    if count > top_count {
+                        top_count = count;
+                        top_value = value;
+                        top_is_tied = false;
+                    } else if count == top_count {
+                        top_is_tied = true;
+                    }
+                }
+                Some(DistinctInfo {
+                    most_frequent_value: top_value,
+                    top_frequency: top_count,
+                    top_is_tied,
+                    distinct_values: DistinctValues::Dense(pairs),
+                })
             }
-            Self::Hashed(distinct_values) => distinct_values,
-        };
+            Self::Hashed(distinct_values) => {
+                let (&top_value, &top_count) = distinct_values
+                    .iter()
+                    .max_by_key(|&(_, &count)| count)
+                    .vortex_expect("we know this is non-empty");
 
-        let (&top_value, &top_count) = distinct_values
-            .iter()
-            .max_by_key(|&(_, &count)| count)
-            .vortex_expect("we know this is non-empty");
-
-        Some(DistinctInfo {
-            distinct_count: u32::try_from(distinct_values.len())
-                .vortex_expect("there are more than `u32::MAX` distinct values"),
-            most_frequent_value: top_value.0,
-            top_frequency: top_count,
-            distinct_values,
-        })
+                Some(DistinctInfo {
+                    most_frequent_value: top_value.0,
+                    top_is_tied: false,
+                    top_frequency: top_count,
+                    distinct_values: DistinctValues::Hashed(distinct_values),
+                })
+            }
+        }
     }
 }
 
@@ -880,3 +960,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod legacy_tests;

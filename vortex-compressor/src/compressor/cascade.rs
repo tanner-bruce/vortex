@@ -597,16 +597,18 @@ impl CascadingCompressor {
         // scheme selection. Samples are exempt because a constant sample does not imply that the
         // full array is constant.
         //
-        // Compare valid values directly so even nullable constants avoid distinct-value counting.
         let _ = before_nbytes;
-        let is_constant = if compress_ctx.logical_strings && data.array().is::<Dict>() {
-            constant::dictionary_is_constant(&data, exec_ctx)?
-        } else {
-            constant::is_constant_for_compression(data.array(), exec_ctx)?
-        };
-        if !compress_ctx.is_sample() && is_constant {
-            return constant::compress_as_constant(data.array().clone(), exec_ctx)
-                .map(|compressed| Ok(Selection::Compressed(compressed)));
+        if !compress_ctx.is_sample() {
+            // Compare valid values directly so even nullable constants avoid distinct counting.
+            let is_constant = if compress_ctx.logical_strings && data.array().is::<Dict>() {
+                constant::dictionary_is_constant(&data, exec_ctx)?
+            } else {
+                constant::is_constant_for_compression(data.array(), exec_ctx)?
+            };
+            if is_constant {
+                return constant::compress_as_constant(data.array().clone(), exec_ctx)
+                    .map(|compressed| Ok(Selection::Compressed(compressed)));
+            }
         }
         Ok(Err(data))
     }
