@@ -10,15 +10,20 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
+use vortex_array::arrays::Bool;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Decimal;
 use vortex_array::arrays::Dict;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Masked;
+use vortex_array::arrays::Null;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::UnionArray;
+use vortex_array::arrays::VarBin;
+use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
 use vortex_array::arrays::dict::DictArraySlotsExt;
@@ -33,6 +38,9 @@ use vortex_array::arrays::union::UnionArrayExt;
 use vortex_array::arrays::union::UnionArraySlotsExt;
 use vortex_array::arrays::variant::VariantArraySlotsExt;
 use vortex_array::dtype::PType;
+use vortex_array::expr::stats::Precision;
+use vortex_array::expr::stats::Stat;
+use vortex_array::expr::stats::StatsProvider;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -219,8 +227,40 @@ impl CascadingCompressor {
                     .map(Selection::into_array);
             }
         }
+        // Carry the direct measure of canonical leaves, constants, and VarBin. An encoding
+        // that must execute before measurement can expose chunks with separate validity bytes.
+        let size = (array.is::<Null>()
+            || array.is::<Bool>()
+            || array.is::<Primitive>()
+            || array.is::<Decimal>()
+            || array.is::<VarBinView>()
+            || array.is::<VarBin>()
+            || array.is::<Constant>())
+        .then(|| array.statistics().get(Stat::UncompressedSizeInBytes));
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
-        self.compress_canonical(canonical.compact(exec_ctx)?, compress_ctx, exec_ctx)
+        let canonical = canonical.compact(exec_ctx)?;
+        if let Some(Precision::Exact(size)) = size
+            && let Some(size) = size.into_value()
+        {
+            let array: &ArrayRef = match &canonical {
+                Canonical::Null(array) => array.as_ref(),
+                Canonical::Bool(array) => array.as_ref(),
+                Canonical::Primitive(array) => array.as_ref(),
+                Canonical::Decimal(array) => array.as_ref(),
+                Canonical::VarBinView(array) => array.as_ref(),
+                Canonical::List(array) => array.as_ref(),
+                Canonical::Map(array) => array.as_ref(),
+                Canonical::FixedSizeList(array) => array.as_ref(),
+                Canonical::Struct(array) => array.as_ref(),
+                Canonical::Union(array) => array.as_ref(),
+                Canonical::Variant(array) => array.as_ref(),
+                Canonical::Extension(array) => array.as_ref(),
+            };
+            array
+                .statistics()
+                .set(Stat::UncompressedSizeInBytes, Precision::Exact(size));
+        }
+        self.compress_canonical(canonical, compress_ctx, exec_ctx)
     }
 
     /// Compresses a canonical array by dispatching to type-specific logic.
@@ -717,3 +757,6 @@ enum Planned {
     /// Leave the array canonical, as its pin says; counted as pinned.
     Canonical,
 }
+
+#[cfg(test)]
+mod tests;

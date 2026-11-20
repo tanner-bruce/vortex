@@ -21,6 +21,7 @@ use fixed_size_list::fixed_size_list_uncompressed_size_in_bytes;
 use list_view::list_view_uncompressed_size_in_bytes;
 use null::null_uncompressed_size_in_bytes;
 use primitive::primitive_uncompressed_size_in_bytes;
+use prost::Message;
 use struct_::struct_uncompressed_size_in_bytes;
 use union::union_uncompressed_size_in_bytes;
 use varbinview::varbinview_uncompressed_size_in_bytes;
@@ -36,7 +37,6 @@ use crate::ArrayRef;
 use crate::Canonical;
 use crate::Columnar;
 use crate::ExecutionCtx;
-use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
@@ -45,7 +45,6 @@ use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::EmptyOptions;
 use crate::array::ArrayView;
 use crate::arrays::Constant;
-use crate::arrays::ConstantArray;
 use crate::arrays::ListView;
 use crate::arrays::map::MapArraySlotsExt;
 use crate::arrays::varbinview::BinaryView;
@@ -56,6 +55,7 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 
 /// Return the uncompressed size of an array in bytes.
 ///
@@ -352,7 +352,10 @@ fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
 pub(crate) fn validity_uncompressed_size_in_bytes(validity: Mask) -> VortexResult<u64> {
     match validity {
         Mask::AllTrue(_) => Ok(0),
-        Mask::AllFalse(len) => Ok(ConstantArray::new(false, len).into_array().nbytes()),
+        // Match the single protobuf scalar buffer of a constant false validity array.
+        Mask::AllFalse(_) => {
+            Ok(ScalarValue::to_proto(Some(&ScalarValue::Bool(false))).encoded_len() as u64)
+        }
         Mask::Values(values) => packed_bit_buffer_size_in_bytes(values.len()),
     }
 }
@@ -373,8 +376,10 @@ mod tests {
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_mask::Mask;
     use vortex_session::VortexSession;
 
+    use super::validity_uncompressed_size_in_bytes;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::RecursiveCanonical;
@@ -864,5 +869,16 @@ mod tests {
         let result = UncompressedSizeInBytes.to_scalar(dtypes.args(&opts), &state)?;
         assert_eq!(result.as_primitive().typed_value::<u64>(), Some(8));
         Ok(())
+    }
+
+    #[test]
+    fn all_false_validity_matches_constant_array() {
+        for len in [1, 7, 8, 9, 63, 64, 65, 65_536] {
+            assert_eq!(
+                validity_uncompressed_size_in_bytes(Mask::AllFalse(len))
+                    .vortex_expect("valid mask"),
+                ConstantArray::new(false, len).nbytes(),
+            );
+        }
     }
 }
